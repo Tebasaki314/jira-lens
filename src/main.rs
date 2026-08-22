@@ -26,6 +26,15 @@ struct Issue {
     parent: String,
     description: String,
     comments: String,
+    custom_values: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CustomField {
+    id: String,
+    name: String,
+    field_type: String,
+    editable: bool,
 }
 
 fn demo_issues() -> Vec<Issue> {
@@ -149,6 +158,7 @@ fn issue(
         parent: parent.into(),
         description: description.into(),
         comments: comments.into(),
+        custom_values: HashMap::new(),
     }
 }
 
@@ -178,7 +188,22 @@ fn parse_duration(value: &str) -> Result<i64, String> {
     Ok(seconds)
 }
 
-fn to_row(issue: &Issue) -> IssueRow {
+fn issue_depth(issue: &Issue, all: &[Issue]) -> i32 {
+    let mut depth = 0;
+    let mut parent = issue.parent.as_str();
+    let mut visited = HashSet::new();
+    while !parent.is_empty() && visited.insert(parent) && depth < all.len() as i32 {
+        depth += 1;
+        parent = all
+            .iter()
+            .find(|candidate| candidate.key == parent)
+            .map(|candidate| candidate.parent.as_str())
+            .unwrap_or("");
+    }
+    depth
+}
+
+fn to_row(issue: &Issue, all: &[Issue], visible_custom_fields: &[CustomField]) -> IssueRow {
     IssueRow {
         key: issue.key.clone().into(),
         summary: issue.summary.clone().into(),
@@ -189,12 +214,35 @@ fn to_row(issue: &Issue) -> IssueRow {
         estimate: issue.estimate.clone().into(),
         spent: issue.spent.clone().into(),
         parent: issue.parent.clone().into(),
+        depth: issue_depth(issue, all),
+        custom_cells: ModelRc::new(VecModel::from(
+            visible_custom_fields
+                .iter()
+                .map(|field| CustomCell {
+                    field_id: field.id.clone().into(),
+                    value: issue
+                        .custom_values
+                        .get(&field.id)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into(),
+                    editable: field.editable,
+                })
+                .collect::<Vec<_>>(),
+        )),
     }
 }
 
-fn filtered_rows(all: &[Issue], query: &str, parent: &str, issue_type: &str) -> Vec<IssueRow> {
+fn filtered_rows(
+    all: &[Issue],
+    query: &str,
+    parent: &str,
+    issue_type: &str,
+    visible_custom_fields: &[CustomField],
+) -> Vec<IssueRow> {
     let needle = query.to_lowercase();
-    all.iter()
+    hierarchical_issues(all)
+        .into_iter()
         .filter(|item| belongs_to_subtree(item, parent, all))
         .filter(|item| issue_type.is_empty() || item.issue_type == issue_type)
         .filter(|item| {
@@ -203,8 +251,52 @@ fn filtered_rows(all: &[Issue], query: &str, parent: &str, issue_type: &str) -> 
                     .iter()
                     .any(|value| value.to_lowercase().contains(&needle))
         })
-        .map(to_row)
+        .map(|issue| to_row(issue, all, visible_custom_fields))
         .collect()
+}
+
+fn hierarchical_issues(all: &[Issue]) -> Vec<&Issue> {
+    let keys = all
+        .iter()
+        .map(|issue| issue.key.as_str())
+        .collect::<HashSet<_>>();
+    let mut children: HashMap<&str, Vec<&Issue>> = HashMap::new();
+    for issue in all {
+        let parent = if issue.parent.is_empty() || !keys.contains(issue.parent.as_str()) {
+            ""
+        } else {
+            issue.parent.as_str()
+        };
+        children.entry(parent).or_default().push(issue);
+    }
+    for group in children.values_mut() {
+        group.sort_by(|left, right| left.key.cmp(&right.key));
+    }
+    fn append<'a>(
+        parent: &str,
+        children: &HashMap<&str, Vec<&'a Issue>>,
+        visited: &mut HashSet<String>,
+        result: &mut Vec<&'a Issue>,
+    ) {
+        if let Some(group) = children.get(parent) {
+            for issue in group {
+                if visited.insert(issue.key.clone()) {
+                    result.push(issue);
+                    append(&issue.key, children, visited, result);
+                }
+            }
+        }
+    }
+    let mut result = Vec::with_capacity(all.len());
+    let mut visited = HashSet::new();
+    append("", &children, &mut visited, &mut result);
+    let mut remainder = all
+        .iter()
+        .filter(|issue| !visited.contains(&issue.key))
+        .collect::<Vec<_>>();
+    remainder.sort_by(|left, right| left.key.cmp(&right.key));
+    result.extend(remainder);
+    result
 }
 
 fn belongs_to_subtree(issue: &Issue, root: &str, all: &[Issue]) -> bool {
@@ -231,6 +323,7 @@ fn build_tree_nodes(
     issues: &[Issue],
     issue_type: &str,
     collapsed: &HashSet<String>,
+    favorites: &HashSet<String>,
 ) -> Vec<TreeNode> {
     let keys: HashSet<_> = issues.iter().map(|item| item.key.as_str()).collect();
     let mut included: HashSet<&str> = HashSet::new();
@@ -268,6 +361,7 @@ fn build_tree_nodes(
         group.sort_by(|left, right| left.key.cmp(&right.key));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append(
         parent: &str,
         depth: i32,
@@ -275,6 +369,8 @@ fn build_tree_nodes(
         collapsed: &HashSet<String>,
         visited: &mut HashSet<String>,
         result: &mut Vec<TreeNode>,
+        favorites: &HashSet<String>,
+        ignore_collapsed: bool,
     ) {
         let Some(group) = children.get(parent) else {
             return;
@@ -288,22 +384,47 @@ fn build_tree_nodes(
                 label: format!("{}  {}", item.key, item.summary).into(),
                 depth,
                 has_children: children.contains_key(item.key.as_str()),
-                expanded: !collapsed.contains(&item.key),
+                expanded: ignore_collapsed || !collapsed.contains(&item.key),
+                favorite: favorites.contains(&item.key),
             });
-            if !collapsed.contains(&item.key) {
-                append(&item.key, depth + 1, children, collapsed, visited, result);
+            if ignore_collapsed || !collapsed.contains(&item.key) {
+                append(
+                    &item.key,
+                    depth + 1,
+                    children,
+                    collapsed,
+                    visited,
+                    result,
+                    favorites,
+                    ignore_collapsed,
+                );
             }
         }
     }
 
-    let mut result = vec![TreeNode {
+    let mut result = favorites
+        .iter()
+        .filter_map(|key| issues.iter().find(|issue| &issue.key == key))
+        .map(|item| TreeNode {
+            key: item.key.clone().into(),
+            label: format!("固定  {}  {}", item.key, item.summary).into(),
+            depth: 0,
+            has_children: false,
+            expanded: true,
+            favorite: true,
+        })
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| left.key.cmp(&right.key));
+    result.push(TreeNode {
         key: "".into(),
         label: "すべての課題".into(),
         depth: 0,
         has_children: children.contains_key(""),
-        expanded: !collapsed.contains(""),
-    }];
-    if !collapsed.contains("") {
+        expanded: !issue_type.is_empty() || !collapsed.contains(""),
+        favorite: false,
+    });
+    let ignore_collapsed = !issue_type.is_empty();
+    if ignore_collapsed || !collapsed.contains("") {
         append(
             "",
             0,
@@ -311,6 +432,8 @@ fn build_tree_nodes(
             collapsed,
             &mut HashSet::new(),
             &mut result,
+            favorites,
+            ignore_collapsed,
         );
     }
     result
@@ -324,11 +447,33 @@ fn apply_issue_models(
     issue_type: &str,
     collapsed: &HashSet<String>,
 ) {
-    let rows = VecModel::from(filtered_rows(issues, query, parent, issue_type));
+    let favorites = ui
+        .get_tree_nodes()
+        .iter()
+        .filter(|node| node.favorite && !node.key.is_empty())
+        .map(|node| node.key.to_string())
+        .collect::<HashSet<_>>();
+    let visible_custom_fields = ui
+        .get_custom_columns()
+        .iter()
+        .map(|column| CustomField {
+            id: column.id.to_string(),
+            name: column.name.to_string(),
+            field_type: String::new(),
+            editable: column.editable,
+        })
+        .collect::<Vec<_>>();
+    let rows = VecModel::from(filtered_rows(
+        issues,
+        query,
+        parent,
+        issue_type,
+        &visible_custom_fields,
+    ));
     ui.set_result_count(rows.row_count() as i32);
     ui.set_issues(ModelRc::new(rows));
     ui.set_tree_nodes(ModelRc::new(VecModel::from(build_tree_nodes(
-        issues, issue_type, collapsed,
+        issues, issue_type, collapsed, &favorites,
     ))));
     let mut types = issues
         .iter()
@@ -348,6 +493,35 @@ fn apply_issue_models(
             .collect::<Vec<_>>(),
     )));
     ui.set_selected_type_index(selected_type_index);
+}
+
+fn apply_custom_field_models(
+    ui: &AppWindow,
+    custom_fields: &[CustomField],
+    visible_ids: &[String],
+) {
+    ui.set_custom_columns(ModelRc::new(VecModel::from(
+        visible_ids
+            .iter()
+            .filter_map(|id| custom_fields.iter().find(|field| &field.id == id))
+            .map(|field| CustomColumn {
+                id: field.id.clone().into(),
+                name: field.name.clone().into(),
+                editable: field.editable,
+            })
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_available_custom_fields(ModelRc::new(VecModel::from(
+        std::iter::once(SharedString::from("項目を追加..."))
+            .chain(
+                custom_fields
+                    .iter()
+                    .filter(|field| !visible_ids.contains(&field.id))
+                    .map(|field| SharedString::from(field.name.clone())),
+            )
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_selected_custom_field_index(0);
 }
 
 fn select_issue(ui: &AppWindow, item: &Issue) {
@@ -489,24 +663,45 @@ fn validate_due(value: &str) -> Result<(), String> {
 
 fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
-    let (initial_status, initial_issues, initial_resource, has_cache) = match storage::load_latest()
-    {
-        Ok(Some((resource, items))) => (
-            format!("キャッシュ: {}", resource.name),
-            items,
-            Some(resource),
-            true,
-        ),
-        Ok(None) => ("未接続・デモ表示".into(), demo_issues(), None, false),
-        Err(error) => (
-            format!("キャッシュエラー: {error}"),
-            demo_issues(),
-            None,
-            false,
-        ),
-    };
+    let (initial_status, initial_issues, initial_resource, initial_custom_fields, has_cache) =
+        match storage::load_latest() {
+            Ok(Some((resource, items, fields))) => (
+                format!("キャッシュ: {}", resource.name),
+                items,
+                Some(resource),
+                fields,
+                true,
+            ),
+            Ok(None) => (
+                "未接続・デモ表示".into(),
+                demo_issues(),
+                None,
+                Vec::new(),
+                false,
+            ),
+            Err(error) => (
+                format!("キャッシュエラー: {error}"),
+                demo_issues(),
+                None,
+                Vec::new(),
+                false,
+            ),
+        };
     let issues = Arc::new(Mutex::new(initial_issues));
     let current_resource = Arc::new(Mutex::new(initial_resource));
+    let custom_fields = Arc::new(Mutex::new(initial_custom_fields));
+    let visible_custom_ids = Arc::new(Mutex::new(
+        storage::load_visible_custom_columns().unwrap_or_default(),
+    ));
+    let favorite_nodes = Arc::new(Mutex::new(
+        current_resource
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|resource| storage::load_favorites(&resource.id).ok())
+            .unwrap_or_default(),
+    ));
+    let edit_draft = Arc::new(Mutex::new(None::<HashMap<String, Issue>>));
     let active_session = Arc::new(Mutex::new(None::<oauth::SavedSession>));
     let current_query = Arc::new(Mutex::new(String::new()));
     let current_parent = Arc::new(Mutex::new(String::new()));
@@ -531,6 +726,11 @@ fn main() -> Result<(), slint::PlatformError> {
             .to_string()
             .into(),
     );
+    apply_custom_field_models(
+        &ui,
+        &custom_fields.lock().unwrap(),
+        &visible_custom_ids.lock().unwrap(),
+    );
     apply_issue_models(
         &ui,
         &issues.lock().unwrap(),
@@ -539,12 +739,21 @@ fn main() -> Result<(), slint::PlatformError> {
         "",
         &collapsed_nodes.lock().unwrap(),
     );
+    ui.set_tree_nodes(ModelRc::new(VecModel::from(build_tree_nodes(
+        &issues.lock().unwrap(),
+        "",
+        &collapsed_nodes.lock().unwrap(),
+        &favorite_nodes.lock().unwrap(),
+    ))));
     apply_calendar(&ui, &calendar_state.lock().unwrap());
     apply_burndown(&ui, current_resource.lock().unwrap().as_ref(), "");
 
     let weak = ui.as_weak();
     let issues_for_connect = issues.clone();
     let resource_for_connect = current_resource.clone();
+    let fields_for_connect = custom_fields.clone();
+    let favorites_for_connect = favorite_nodes.clone();
+    let visible_for_connect = visible_custom_ids.clone();
     let session_for_connect = active_session.clone();
     let query_for_connect = current_query.clone();
     let parent_for_connect = current_parent.clone();
@@ -560,6 +769,9 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak_for_result = ui.as_weak();
         let issues_for_result = issues_for_connect.clone();
         let resource_for_result = resource_for_connect.clone();
+        let fields_for_result = fields_for_connect.clone();
+        let favorites_for_result = favorites_for_connect.clone();
+        let visible_for_result = visible_for_connect.clone();
         let session_for_result = session_for_connect.clone();
         let query_for_result = query_for_connect.clone();
         let parent_for_result = parent_for_connect.clone();
@@ -569,9 +781,10 @@ fn main() -> Result<(), slint::PlatformError> {
             let result = oauth::connect().and_then(|session| {
                 jira::fetch_all_issues(&session)
                     .map_err(oauth::OAuthError::message)
-                    .map(|(resource, fetched)| {
-                        let cache_error = storage::replace_issues(&resource, &fetched).err();
-                        (session, resource, fetched, cache_error)
+                    .map(|(resource, fetched, fields)| {
+                        let cache_error =
+                            storage::replace_issues(&resource, &fetched, &fields).err();
+                        (session, resource, fetched, fields, cache_error)
                     })
             });
             let _ = slint::invoke_from_event_loop(move || {
@@ -580,15 +793,23 @@ fn main() -> Result<(), slint::PlatformError> {
                 };
                 ui.set_connection_busy(false);
                 match result {
-                    Ok((session, resource, fetched, cache_error)) => {
+                    Ok((session, resource, fetched, fields, cache_error)) => {
                         *session_for_result.lock().unwrap() = Some(session);
                         *resource_for_result.lock().unwrap() = Some(resource.clone());
                         *issues_for_result.lock().unwrap() = fetched;
+                        *fields_for_result.lock().unwrap() = fields;
+                        *favorites_for_result.lock().unwrap() =
+                            storage::load_favorites(&resource.id).unwrap_or_default();
                         query_for_result.lock().unwrap().clear();
                         parent_for_result.lock().unwrap().clear();
                         type_for_result.lock().unwrap().clear();
                         collapsed_for_result.lock().unwrap().clear();
                         let guard = issues_for_result.lock().unwrap();
+                        apply_custom_field_models(
+                            &ui,
+                            &fields_for_result.lock().unwrap(),
+                            &visible_for_result.lock().unwrap(),
+                        );
                         apply_issue_models(
                             &ui,
                             &guard,
@@ -597,6 +818,12 @@ fn main() -> Result<(), slint::PlatformError> {
                             "",
                             &collapsed_for_result.lock().unwrap(),
                         );
+                        ui.set_tree_nodes(ModelRc::new(VecModel::from(build_tree_nodes(
+                            &guard,
+                            "",
+                            &collapsed_for_result.lock().unwrap(),
+                            &favorites_for_result.lock().unwrap(),
+                        ))));
                         apply_burndown(&ui, Some(&resource), "");
                         ui.set_active_parent("すべての課題".into());
                         ui.set_has_synced_data(true);
@@ -777,6 +1004,284 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let weak = ui.as_weak();
+    let all = issues.clone();
+    let resource = current_resource.clone();
+    let favorites = favorite_nodes.clone();
+    let type_state = current_type.clone();
+    let collapsed_state = collapsed_nodes.clone();
+    ui.on_toggle_favorite(move |key| {
+        let key = key.to_string();
+        let mut values = favorites.lock().unwrap();
+        let enabled = if values.insert(key.clone()) {
+            true
+        } else {
+            values.remove(&key);
+            false
+        };
+        if let Some(resource) = resource.lock().unwrap().as_ref()
+            && let Err(error) = storage::set_favorite(&resource.id, &key, enabled)
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.set_action_status(error.into());
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.set_tree_nodes(ModelRc::new(VecModel::from(build_tree_nodes(
+                &all.lock().unwrap(),
+                &type_state.lock().unwrap(),
+                &collapsed_state.lock().unwrap(),
+                &values,
+            ))));
+        }
+    });
+
+    let weak = ui.as_weak();
+    let all = issues.clone();
+    let fields = custom_fields.clone();
+    let visible = visible_custom_ids.clone();
+    let query = current_query.clone();
+    let parent = current_parent.clone();
+    let issue_type = current_type.clone();
+    let collapsed = collapsed_nodes.clone();
+    ui.on_add_custom_column(move |name| {
+        if name == "項目を追加..." {
+            return;
+        }
+        let fields_guard = fields.lock().unwrap();
+        let Some(field) = fields_guard
+            .iter()
+            .find(|field| field.name == name.as_str())
+        else {
+            return;
+        };
+        let mut visible_guard = visible.lock().unwrap();
+        if !visible_guard.contains(&field.id) {
+            visible_guard.push(field.id.clone());
+        }
+        if let Some(ui) = weak.upgrade() {
+            if let Err(error) = storage::save_visible_custom_columns(&visible_guard) {
+                ui.set_action_status(error.into());
+            }
+            apply_custom_field_models(&ui, &fields_guard, &visible_guard);
+            apply_issue_models(
+                &ui,
+                &all.lock().unwrap(),
+                &query.lock().unwrap(),
+                &parent.lock().unwrap(),
+                &issue_type.lock().unwrap(),
+                &collapsed.lock().unwrap(),
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
+    let all = issues.clone();
+    let fields = custom_fields.clone();
+    let visible = visible_custom_ids.clone();
+    let query = current_query.clone();
+    let parent = current_parent.clone();
+    let issue_type = current_type.clone();
+    let collapsed = collapsed_nodes.clone();
+    ui.on_remove_custom_column(move |id| {
+        let mut visible_guard = visible.lock().unwrap();
+        visible_guard.retain(|value| value != id.as_str());
+        if let Some(ui) = weak.upgrade() {
+            if let Err(error) = storage::save_visible_custom_columns(&visible_guard) {
+                ui.set_action_status(error.into());
+            }
+            apply_custom_field_models(&ui, &fields.lock().unwrap(), &visible_guard);
+            apply_issue_models(
+                &ui,
+                &all.lock().unwrap(),
+                &query.lock().unwrap(),
+                &parent.lock().unwrap(),
+                &issue_type.lock().unwrap(),
+                &collapsed.lock().unwrap(),
+            );
+        }
+    });
+
+    let draft = edit_draft.clone();
+    let all = issues.clone();
+    ui.on_begin_table_edit(move || {
+        *draft.lock().unwrap() = Some(
+            all.lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(|issue| (issue.key.clone(), issue))
+                .collect(),
+        );
+    });
+
+    let draft = edit_draft.clone();
+    ui.on_edit_table_cell(move |key, field, value| {
+        let mut guard = draft.lock().unwrap();
+        let Some(issue) = guard.as_mut().and_then(|items| items.get_mut(key.as_str())) else {
+            return;
+        };
+        match field.as_str() {
+            "summary" => issue.summary = value.to_string(),
+            "duedate" => issue.due = value.to_string(),
+            "estimate" => issue.estimate = value.to_string(),
+            id => {
+                issue.custom_values.insert(id.to_owned(), value.to_string());
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let draft = edit_draft.clone();
+    let all = issues.clone();
+    let query = current_query.clone();
+    let parent = current_parent.clone();
+    let issue_type = current_type.clone();
+    let collapsed = collapsed_nodes.clone();
+    ui.on_discard_table_edit(move || {
+        *draft.lock().unwrap() = None;
+        if let Some(ui) = weak.upgrade() {
+            ui.set_edit_mode(false);
+            apply_issue_models(
+                &ui,
+                &all.lock().unwrap(),
+                &query.lock().unwrap(),
+                &parent.lock().unwrap(),
+                &issue_type.lock().unwrap(),
+                &collapsed.lock().unwrap(),
+            );
+            ui.set_action_status("一覧の変更を破棄しました。".into());
+        }
+    });
+
+    let weak = ui.as_weak();
+    let draft = edit_draft.clone();
+    let all = issues.clone();
+    let fields = custom_fields.clone();
+    let visible = visible_custom_ids.clone();
+    let session = active_session.clone();
+    let resource = current_resource.clone();
+    let query = current_query.clone();
+    let parent = current_parent.clone();
+    let issue_type = current_type.clone();
+    let collapsed = collapsed_nodes.clone();
+    ui.on_save_table_edit(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_action_busy() {
+            return;
+        }
+        let Some(session_value) = session.lock().unwrap().clone() else {
+            ui.set_action_status("編集内容の保存前に「再同期」でJiraへ接続してください。".into());
+            return;
+        };
+        let originals = all.lock().unwrap().clone();
+        let Some(draft_values) = draft.lock().unwrap().clone() else {
+            return;
+        };
+        let changed = originals
+            .iter()
+            .filter_map(|original| {
+                let updated = draft_values.get(&original.key)?;
+                if original.summary != updated.summary
+                    || original.due != updated.due
+                    || original.estimate != updated.estimate
+                    || original.custom_values != updated.custom_values
+                {
+                    Some(updated.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for issue in &changed {
+            if issue.summary.trim().is_empty() {
+                ui.set_action_status(format!("{}: タイトルは空にできません。", issue.key).into());
+                return;
+            }
+            if let Err(error) = validate_due(&issue.due) {
+                ui.set_action_status(format!("{}: {error}", issue.key).into());
+                return;
+            }
+            if let Err(error) = parse_duration(&issue.estimate) {
+                ui.set_action_status(format!("{}: {error}", issue.key).into());
+                return;
+            }
+        }
+        if changed.is_empty() {
+            *draft.lock().unwrap() = None;
+            ui.set_edit_mode(false);
+            ui.set_action_status("変更はありません。".into());
+            return;
+        }
+        ui.set_action_busy(true);
+        ui.set_action_status(format!("{}件の課題を保存中...", changed.len()).into());
+        let weak_result = ui.as_weak();
+        let all_result = all.clone();
+        let fields_result = fields.clone();
+        let visible_result = visible.clone();
+        let resource_result = resource.clone();
+        let draft_result = draft.clone();
+        let query_result = query.clone();
+        let parent_result = parent.clone();
+        let type_result = issue_type.clone();
+        let collapsed_result = collapsed.clone();
+        let field_defs = fields.lock().unwrap().clone();
+        std::thread::spawn(move || {
+            let result = changed
+                .iter()
+                .try_for_each(|issue| {
+                    jira::update_issue_fields(
+                        &session_value,
+                        &issue.key,
+                        &issue.summary,
+                        &issue.due,
+                        parse_duration(&issue.estimate)?,
+                        &issue.custom_values,
+                        &field_defs,
+                    )
+                })
+                .and_then(|()| jira::fetch_all_issues(&session_value))
+                .map(|(resource, fetched, fields)| {
+                    let cache_error = storage::replace_issues(&resource, &fetched, &fields).err();
+                    (resource, fetched, fields, cache_error)
+                });
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak_result.upgrade() else {
+                    return;
+                };
+                ui.set_action_busy(false);
+                match result {
+                    Ok((new_resource, fetched, new_fields, cache_error)) => {
+                        *all_result.lock().unwrap() = fetched;
+                        *fields_result.lock().unwrap() = new_fields;
+                        *resource_result.lock().unwrap() = Some(new_resource);
+                        *draft_result.lock().unwrap() = None;
+                        ui.set_edit_mode(false);
+                        apply_custom_field_models(
+                            &ui,
+                            &fields_result.lock().unwrap(),
+                            &visible_result.lock().unwrap(),
+                        );
+                        apply_issue_models(
+                            &ui,
+                            &all_result.lock().unwrap(),
+                            &query_result.lock().unwrap(),
+                            &parent_result.lock().unwrap(),
+                            &type_result.lock().unwrap(),
+                            &collapsed_result.lock().unwrap(),
+                        );
+                        ui.set_action_status(
+                            cache_error
+                                .map(|error| format!("Jira更新済み・キャッシュ失敗: {error}"))
+                                .unwrap_or_else(|| "一覧の変更を保存しました。".into())
+                                .into(),
+                        );
+                    }
+                    Err(error) => ui.set_action_status(format!("一覧の保存エラー: {error}").into()),
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
     let calendar = calendar_state.clone();
     ui.on_calendar_previous(move || {
         if let Some(ui) = weak.upgrade() {
@@ -818,6 +1323,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let weak = ui.as_weak();
     let all_for_save = issues.clone();
     let resource_for_save = current_resource.clone();
+    let fields_for_save = custom_fields.clone();
+    let visible_for_save = visible_custom_ids.clone();
     let session_for_save = active_session.clone();
     let query_for_save = current_query.clone();
     let parent_for_save = current_parent.clone();
@@ -852,6 +1359,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak_for_result = ui.as_weak();
         let all_for_result = all_for_save.clone();
         let resource_for_result = resource_for_save.clone();
+        let fields_for_result = fields_for_save.clone();
+        let visible_for_result = visible_for_save.clone();
         let query_for_result = query_for_save.clone();
         let parent_for_result = parent_for_save.clone();
         let type_for_result = type_for_save.clone();
@@ -868,9 +1377,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 estimate_seconds,
             )
             .and_then(|()| jira::fetch_all_issues(&session))
-            .map(|(resource, fetched)| {
-                let cache_error = storage::replace_issues(&resource, &fetched).err();
-                (resource, fetched, cache_error)
+            .map(|(resource, fetched, fields)| {
+                let cache_error = storage::replace_issues(&resource, &fetched, &fields).err();
+                (resource, fetched, fields, cache_error)
             });
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(ui) = weak_for_result.upgrade() else {
@@ -878,13 +1387,19 @@ fn main() -> Result<(), slint::PlatformError> {
                 };
                 ui.set_action_busy(false);
                 match result {
-                    Ok((resource, fetched, cache_error)) => {
+                    Ok((resource, fetched, fields, cache_error)) => {
                         *resource_for_result.lock().unwrap() = Some(resource.clone());
                         *all_for_result.lock().unwrap() = fetched;
+                        *fields_for_result.lock().unwrap() = fields;
                         let guard = all_for_result.lock().unwrap();
                         let query = query_for_result.lock().unwrap().clone();
                         let parent = parent_for_result.lock().unwrap().clone();
                         let issue_type = type_for_result.lock().unwrap().clone();
+                        apply_custom_field_models(
+                            &ui,
+                            &fields_for_result.lock().unwrap(),
+                            &visible_for_result.lock().unwrap(),
+                        );
                         apply_issue_models(
                             &ui,
                             &guard,
@@ -913,6 +1428,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let weak = ui.as_weak();
     let all_for_worklog = issues.clone();
     let resource_for_worklog = current_resource.clone();
+    let fields_for_worklog = custom_fields.clone();
+    let visible_for_worklog = visible_custom_ids.clone();
     let session_for_worklog = active_session;
     let query_for_worklog = current_query;
     let parent_for_worklog = current_parent;
@@ -932,6 +1449,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak_for_result = ui.as_weak();
         let all_for_result = all_for_worklog.clone();
         let resource_for_result = resource_for_worklog.clone();
+        let fields_for_result = fields_for_worklog.clone();
+        let visible_for_result = visible_for_worklog.clone();
         let query_for_result = query_for_worklog.clone();
         let parent_for_result = parent_for_worklog.clone();
         let type_for_result = type_for_worklog.clone();
@@ -942,9 +1461,9 @@ fn main() -> Result<(), slint::PlatformError> {
         std::thread::spawn(move || {
             let result = jira::add_worklog(&session, &key, &date, &time, minutes)
                 .and_then(|()| jira::fetch_all_issues(&session))
-                .map(|(resource, fetched)| {
-                    let cache_error = storage::replace_issues(&resource, &fetched).err();
-                    (resource, fetched, cache_error)
+                .map(|(resource, fetched, fields)| {
+                    let cache_error = storage::replace_issues(&resource, &fetched, &fields).err();
+                    (resource, fetched, fields, cache_error)
                 });
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(ui) = weak_for_result.upgrade() else {
@@ -952,13 +1471,19 @@ fn main() -> Result<(), slint::PlatformError> {
                 };
                 ui.set_action_busy(false);
                 match result {
-                    Ok((resource, fetched, cache_error)) => {
+                    Ok((resource, fetched, fields, cache_error)) => {
                         *resource_for_result.lock().unwrap() = Some(resource.clone());
                         *all_for_result.lock().unwrap() = fetched;
+                        *fields_for_result.lock().unwrap() = fields;
                         let guard = all_for_result.lock().unwrap();
                         let query = query_for_result.lock().unwrap().clone();
                         let parent = parent_for_result.lock().unwrap().clone();
                         let issue_type = type_for_result.lock().unwrap().clone();
+                        apply_custom_field_models(
+                            &ui,
+                            &fields_for_result.lock().unwrap(),
+                            &visible_for_result.lock().unwrap(),
+                        );
                         apply_issue_models(
                             &ui,
                             &guard,
@@ -997,7 +1522,7 @@ mod tests {
     #[test]
     fn parent_filter_includes_all_descendants() {
         let items = demo_issues();
-        let keys: Vec<_> = filtered_rows(&items, "", "APP-102", "")
+        let keys: Vec<_> = filtered_rows(&items, "", "APP-102", "", &[])
             .into_iter()
             .map(|row| row.key.to_string())
             .collect();
@@ -1007,13 +1532,13 @@ mod tests {
     #[test]
     fn search_covers_description_and_comments() {
         let items = demo_issues();
-        assert_eq!(filtered_rows(&items, "キーボード", "", "").len(), 1);
-        assert_eq!(filtered_rows(&items, "仮想リスト", "", "").len(), 1);
+        assert_eq!(filtered_rows(&items, "キーボード", "", "", &[]).len(), 1);
+        assert_eq!(filtered_rows(&items, "仮想リスト", "", "", &[]).len(), 1);
     }
 
     #[test]
     fn tree_contains_nested_real_issue_models() {
-        let tree = build_tree_nodes(&demo_issues(), "", &HashSet::new());
+        let tree = build_tree_nodes(&demo_issues(), "", &HashSet::new(), &HashSet::new());
         let nested = tree
             .iter()
             .find(|node| node.key.as_str() == "APP-105")
@@ -1024,7 +1549,7 @@ mod tests {
     #[test]
     fn collapsed_tree_hides_descendants() {
         let collapsed = HashSet::from(["APP-102".to_owned()]);
-        let tree = build_tree_nodes(&demo_issues(), "", &collapsed);
+        let tree = build_tree_nodes(&demo_issues(), "", &collapsed, &HashSet::new());
         assert!(tree.iter().any(|node| node.key.as_str() == "APP-102"));
         assert!(!tree.iter().any(|node| node.key.as_str() == "APP-105"));
     }
@@ -1032,12 +1557,48 @@ mod tests {
     #[test]
     fn issue_type_filter_keeps_tree_ancestors_as_context() {
         let items = demo_issues();
-        let rows = filtered_rows(&items, "", "", "タスク");
+        let rows = filtered_rows(&items, "", "", "タスク", &[]);
         assert_eq!(rows.len(), 5);
-        let tree = build_tree_nodes(&items, "タスク", &HashSet::new());
+        let tree = build_tree_nodes(&items, "タスク", &HashSet::new(), &HashSet::new());
         assert!(tree.iter().any(|node| node.key.as_str() == "APP-100"));
         assert!(tree.iter().any(|node| node.key.as_str() == "APP-101"));
         assert!(!tree.iter().any(|node| node.key.as_str() == "OPS-20"));
+    }
+
+    #[test]
+    fn issue_type_filter_ignores_collapsed_ancestors() {
+        let tree = build_tree_nodes(
+            &demo_issues(),
+            "タスク",
+            &HashSet::from(["APP-100".to_owned(), "APP-102".to_owned()]),
+            &HashSet::new(),
+        );
+        assert!(tree.iter().any(|node| node.key.as_str() == "APP-105"));
+    }
+
+    #[test]
+    fn favorites_are_pinned_before_the_tree_root() {
+        let tree = build_tree_nodes(
+            &demo_issues(),
+            "",
+            &HashSet::new(),
+            &HashSet::from(["APP-105".to_owned()]),
+        );
+        assert_eq!(tree[0].key.as_str(), "APP-105");
+        assert!(tree[0].favorite);
+        assert_eq!(tree[1].key.as_str(), "");
+    }
+
+    #[test]
+    fn table_rows_include_hierarchy_depth() {
+        let rows = filtered_rows(&demo_issues(), "", "", "", &[]);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.key.as_str() == "APP-105")
+                .unwrap()
+                .depth,
+            2
+        );
     }
 
     #[test]

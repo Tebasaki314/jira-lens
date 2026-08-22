@@ -1,10 +1,10 @@
-use crate::Issue;
 use crate::oauth::{JiraResource, SavedSession};
+use crate::{CustomField, Issue};
 use chrono::{Local, NaiveDateTime, TimeZone};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const PAGE_SIZE: u16 = 100;
@@ -14,7 +14,7 @@ const MAX_PAGES: usize = 1000;
 #[serde(rename_all = "camelCase")]
 struct SearchRequest<'a> {
     jql: &'a str,
-    fields: &'a [&'a str],
+    fields: &'a [String],
     fields_by_keys: bool,
     max_results: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,6 +70,23 @@ struct ApiFields {
     parent: Option<ParentIssue>,
     description: Option<Value>,
     comment: Option<CommentPage>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct ApiField {
+    id: String,
+    name: String,
+    #[serde(default)]
+    custom: bool,
+    schema: Option<ApiFieldSchema>,
+}
+
+#[derive(Deserialize)]
+struct ApiFieldSchema {
+    #[serde(rename = "type")]
+    field_type: String,
 }
 
 #[derive(Deserialize)]
@@ -124,6 +141,65 @@ pub fn update_issue(
     send_without_response(
         client
             .put(endpoint)
+            .bearer_auth(&session.tokens.access_token)
+            .json(&body),
+        "Jira課題の更新",
+    )
+}
+
+pub fn update_issue_fields(
+    session: &SavedSession,
+    issue_key: &str,
+    summary: &str,
+    due: &str,
+    estimate_seconds: i64,
+    custom_values: &HashMap<String, String>,
+    custom_fields: &[CustomField],
+) -> Result<(), String> {
+    let resource = primary_resource(session)?;
+    let client = jira_client()?;
+    let mut fields = serde_json::Map::new();
+    fields.insert("summary".into(), Value::String(summary.trim().to_owned()));
+    fields.insert(
+        "duedate".into(),
+        if due.trim().is_empty() {
+            Value::Null
+        } else {
+            Value::String(due.trim().to_owned())
+        },
+    );
+    fields.insert(
+        "timetracking".into(),
+        serde_json::json!({"originalEstimate": jira_duration(estimate_seconds)}),
+    );
+    for (id, value) in custom_values {
+        let Some(field) = custom_fields
+            .iter()
+            .find(|field| &field.id == id && field.editable)
+        else {
+            continue;
+        };
+        let value = if value.trim().is_empty() {
+            Value::Null
+        } else if field.field_type == "number" {
+            Value::Number(
+                value
+                    .trim()
+                    .parse::<serde_json::Number>()
+                    .map_err(|_| format!("{} は数値で入力してください。", field.name))?,
+            )
+        } else {
+            Value::String(value.to_string())
+        };
+        fields.insert(id.clone(), value);
+    }
+    let body = Value::Object(serde_json::Map::from_iter([(
+        "fields".into(),
+        Value::Object(fields),
+    )]));
+    send_without_response(
+        client
+            .put(issue_endpoint(resource, issue_key))
             .bearer_auth(&session.tokens.access_token)
             .json(&body),
         "Jira課題の更新",
@@ -226,11 +302,14 @@ fn jira_duration(seconds: i64) -> String {
     format!("{minutes}m")
 }
 
-pub fn fetch_all_issues(session: &SavedSession) -> Result<(JiraResource, Vec<Issue>), String> {
+pub fn fetch_all_issues(
+    session: &SavedSession,
+) -> Result<(JiraResource, Vec<Issue>, Vec<CustomField>), String> {
     let resource = primary_resource(session)?.clone();
     let client = jira_client()?;
+    let custom_fields = fetch_custom_fields(&client, &resource, &session.tokens.access_token)?;
     let project_keys = fetch_project_keys(&client, &resource, &session.tokens.access_token)?;
-    let fields = [
+    let mut fields = vec![
         "summary",
         "status",
         "issuetype",
@@ -241,7 +320,11 @@ pub fn fetch_all_issues(session: &SavedSession) -> Result<(JiraResource, Vec<Iss
         "parent",
         "description",
         "comment",
-    ];
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    fields.extend(custom_fields.iter().map(|field| field.id.clone()));
     let mut result = Vec::new();
     for project_key in project_keys {
         result.extend(fetch_project_issues(
@@ -255,7 +338,51 @@ pub fn fetch_all_issues(session: &SavedSession) -> Result<(JiraResource, Vec<Iss
 
     let mut seen = HashSet::new();
     result.retain(|issue| seen.insert(issue.key.clone()));
-    Ok((resource, result))
+    Ok((resource, result, custom_fields))
+}
+
+fn fetch_custom_fields(
+    client: &Client,
+    resource: &JiraResource,
+    access_token: &str,
+) -> Result<Vec<CustomField>, String> {
+    let endpoint = format!(
+        "https://api.atlassian.com/ex/jira/{}/rest/api/3/field",
+        resource.id
+    );
+    let response = client
+        .get(endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()
+        .map_err(|error| format!("Jira項目一覧の取得に失敗しました: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "Jira項目一覧の取得に失敗しました ({status}): {}",
+            response.text().unwrap_or_default()
+        ));
+    }
+    let mut fields = response
+        .json::<Vec<ApiField>>()
+        .map_err(|error| format!("Jira項目一覧を解析できません: {error}"))?
+        .into_iter()
+        .filter(|field| field.custom)
+        .map(|field| {
+            let field_type = field
+                .schema
+                .map(|schema| schema.field_type)
+                .unwrap_or_default();
+            CustomField {
+                id: field.id,
+                name: field.name,
+                editable: matches!(field_type.as_str(), "string" | "number" | "date"),
+                field_type,
+            }
+        })
+        .collect::<Vec<_>>();
+    fields.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(fields)
 }
 
 fn fetch_project_keys(
@@ -306,7 +433,7 @@ fn fetch_project_issues(
     resource: &JiraResource,
     access_token: &str,
     jql: &str,
-    fields: &[&str],
+    fields: &[String],
 ) -> Result<Vec<Issue>, String> {
     let endpoint = format!(
         "https://api.atlassian.com/ex/jira/{}/rest/api/3/search/jql",
@@ -368,6 +495,12 @@ impl From<ApiIssue> for Issue {
                     .join("\n")
             })
             .unwrap_or_default();
+        let custom_values = fields
+            .extra
+            .iter()
+            .filter(|(id, _)| id.starts_with("customfield_"))
+            .map(|(id, value)| (id.clone(), display_custom_value(value)))
+            .collect();
         Self {
             key: issue.key,
             summary: fields.summary,
@@ -386,7 +519,27 @@ impl From<ApiIssue> for Issue {
                 .map(adf_to_text)
                 .unwrap_or_default(),
             comments,
+            custom_values,
         }
+    }
+}
+
+fn display_custom_value(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(value) => value.clone(),
+        Value::Number(value) => value.to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Array(values) => values
+            .iter()
+            .map(display_custom_value)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::Object(map) => ["displayName", "name", "value", "key"]
+            .iter()
+            .find_map(|key| map.get(*key).map(display_custom_value))
+            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
     }
 }
 
