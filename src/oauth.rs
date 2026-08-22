@@ -75,10 +75,12 @@ impl std::error::Error for OAuthError {}
 
 pub fn connect() -> Result<SavedSession, OAuthError> {
     let config = OAuthConfig::from_env()?;
-    if let Some(saved) = load_session()
-        && let Some(refresh_token) = saved.tokens.refresh_token.as_deref()
-        && let Ok(tokens) = refresh(&config, refresh_token)
+    if let Some(previous_refresh_token) = load_refresh_token()
+        && let Ok(mut tokens) = refresh(&config, &previous_refresh_token)
     {
+        if tokens.refresh_token.is_none() {
+            tokens.refresh_token = Some(previous_refresh_token);
+        }
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -86,7 +88,7 @@ pub fn connect() -> Result<SavedSession, OAuthError> {
         let resources = fetch_resources(&client, &tokens.access_token)?;
         if !resources.is_empty() {
             let session = SavedSession { tokens, resources };
-            save_session(&session)?;
+            save_refresh_token(&session.tokens)?;
             return Ok(session);
         }
     }
@@ -114,7 +116,7 @@ pub fn connect() -> Result<SavedSession, OAuthError> {
     }
 
     let session = SavedSession { tokens, resources };
-    save_session(&session)?;
+    save_refresh_token(&session.tokens)?;
     Ok(session)
 }
 
@@ -328,20 +330,39 @@ fn fetch_resources(client: &Client, access_token: &str) -> Result<Vec<JiraResour
     response.json::<Vec<JiraResource>>().map_err(http_error)
 }
 
-fn save_session(session: &SavedSession) -> Result<(), OAuthError> {
-    let serialized = serde_json::to_string(session)
-        .map_err(|error| OAuthError(format!("OAuth情報を保存できません: {error}")))?;
+fn refresh_token_to_store(tokens: &TokenSet) -> Result<&str, OAuthError> {
+    let refresh_token = tokens.refresh_token.as_deref().ok_or_else(|| {
+        OAuthError("Atlassianからリフレッシュトークンが返されませんでした。".into())
+    })?;
+    if refresh_token.encode_utf16().count() > 2500 {
+        return Err(OAuthError(
+            "リフレッシュトークンがWindows Credential Managerの上限を超えています。".into(),
+        ));
+    }
+    Ok(refresh_token)
+}
+
+fn save_refresh_token(tokens: &TokenSet) -> Result<(), OAuthError> {
+    let refresh_token = refresh_token_to_store(tokens)?;
     Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-        .and_then(|entry| entry.set_password(&serialized))
+        .and_then(|entry| entry.set_password(refresh_token))
         .map_err(|error| OAuthError(format!("OS資格情報ストアへ保存できません: {error}")))
 }
 
-fn load_session() -> Option<SavedSession> {
-    let serialized = Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+fn load_refresh_token() -> Option<String> {
+    let stored = Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
         .ok()?
         .get_password()
         .ok()?;
-    serde_json::from_str(&serialized).ok()
+    if stored.starts_with('{') {
+        // v0.1.0ではセッション全体を保存していたため、既存のmacOS Keychainを移行する。
+        serde_json::from_str::<SavedSession>(&stored)
+            .ok()?
+            .tokens
+            .refresh_token
+    } else {
+        Some(stored)
+    }
 }
 
 fn http_error(error: reqwest::Error) -> OAuthError {
@@ -375,5 +396,19 @@ mod tests {
         assert!(validate_loopback_redirect("http://localhost:53682/callback").is_ok());
         assert!(validate_loopback_redirect("http://127.0.0.1:53682/callback").is_ok());
         assert!(validate_loopback_redirect("https://example.com/callback").is_err());
+    }
+
+    #[test]
+    fn credential_store_receives_only_the_refresh_token() {
+        let tokens = TokenSet {
+            access_token: "large-access-token-that-must-not-be-saved".repeat(200),
+            refresh_token: Some("small-refresh-token".into()),
+            expires_in: 3600,
+            scope: SCOPES.into(),
+        };
+        assert_eq!(
+            refresh_token_to_store(&tokens).unwrap(),
+            "small-refresh-token"
+        );
     }
 }
