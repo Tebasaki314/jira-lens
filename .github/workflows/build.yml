@@ -58,4 +58,5 @@ jobs:
         run: >-
           gh release create "$GITHUB_REF_NAME"
           jira-lens-macos.tar.gz jira-lens-windows.zip
+          --repo "$GITHUB_REPOSITORY"
           --generate-notes --title "Jira Lens $GITHUB_REF_NAME"
