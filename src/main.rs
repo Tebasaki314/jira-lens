@@ -4,9 +4,7 @@ mod storage;
 
 use chrono::{Datelike, Local, NaiveDate};
 use slint::{Model, ModelRc, SharedString, VecModel};
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 slint::include_modules!();
@@ -242,7 +240,17 @@ fn to_row(
                         .unwrap_or_default()
                         .into(),
                     editable: field.editable,
-                    boolean: field.field_type == "boolean",
+                    boolean: matches!(field.field_type.as_str(), "boolean" | "flag"),
+                    checked: if field.field_type == "flag" {
+                        issue
+                            .custom_values
+                            .get(&field.id)
+                            .is_some_and(|value| !value.trim().is_empty())
+                    } else {
+                        issue.custom_values.get(&field.id).is_some_and(|value| {
+                            matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1")
+                        })
+                    },
                 })
                 .collect::<Vec<_>>(),
         )),
@@ -485,6 +493,15 @@ fn apply_issue_models(
     issue_type: &str,
     collapsed: &HashSet<String>,
 ) {
+    let required_key_width = issues
+        .iter()
+        .map(|issue| issue.key.chars().count())
+        .max()
+        .map(|length| (length as f32 * 7.0 + 18.0).clamp(112.0, 260.0))
+        .unwrap_or(112.0);
+    if ui.get_key_column_width() < required_key_width {
+        ui.set_key_column_width(required_key_width);
+    }
     let favorites = ui
         .get_tree_nodes()
         .iter()
@@ -497,7 +514,7 @@ fn apply_issue_models(
         .map(|column| CustomField {
             id: column.id.to_string(),
             name: column.name.to_string(),
-            field_type: String::new(),
+            field_type: column.field_type.to_string(),
             editable: column.editable,
         })
         .collect::<Vec<_>>();
@@ -567,6 +584,7 @@ fn apply_custom_field_models(
                 id: field.id.clone().into(),
                 name: field.name.clone().into(),
                 editable: field.editable,
+                field_type: field.field_type.clone().into(),
             })
             .collect::<Vec<_>>(),
     )));
@@ -588,6 +606,9 @@ fn select_issue(ui: &AppWindow, item: &Issue) {
     ui.set_selected_summary(item.summary.clone().into());
     ui.set_selected_description(item.description.clone().into());
     ui.set_selected_comments(item.comments.clone().into());
+    ui.set_selected_issue_type(item.issue_type.clone().into());
+    ui.set_selected_status(item.status.clone().into());
+    ui.set_selected_assignee(item.assignee.clone().into());
     ui.set_selected_due(item.due.clone().into());
     ui.set_selected_estimate(item.estimate.clone().into());
     ui.set_selected_spent(item.spent.clone().into());
@@ -691,7 +712,6 @@ fn main() -> Result<(), slint::PlatformError> {
     let current_type = Arc::new(Mutex::new(String::new()));
     let collapsed_nodes = Arc::new(Mutex::new(HashSet::<String>::new()));
     let calendar_state = Arc::new(Mutex::new(CalendarState::today()));
-    let detail_windows = Rc::new(RefCell::new(Vec::<IssueDetailWindow>::new()));
 
     ui.set_connection_status(initial_status.into());
     ui.set_has_synced_data(has_cache);
@@ -842,32 +862,24 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let weak = ui.as_weak();
-    let items = issues.clone();
-    let windows = detail_windows;
-    ui.on_open_selected_issue(move || {
+    let resource = current_resource.clone();
+    ui.on_open_issue_in_jira(move || {
         let Some(ui) = weak.upgrade() else { return };
         let selected_key = ui.get_selected_key();
-        let guard = items.lock().unwrap();
-        let Some(item) = guard.iter().find(|item| item.key == selected_key.as_str()) else {
+        if selected_key.is_empty() {
+            return;
+        }
+        let Some(resource) = resource.lock().unwrap().clone() else {
+            ui.set_action_status("Jiraサイト情報がありません。先に再同期してください。".into());
             return;
         };
-        let Ok(window) = IssueDetailWindow::new() else {
-            ui.set_action_status("課題ウィンドウを作成できませんでした。".into());
-            return;
-        };
-        window.set_issue_key(item.key.clone().into());
-        window.set_summary(item.summary.clone().into());
-        window.set_issue_type(item.issue_type.clone().into());
-        window.set_status(item.status.clone().into());
-        window.set_assignee(item.assignee.clone().into());
-        window.set_due(item.due.clone().into());
-        window.set_estimate(item.estimate.clone().into());
-        window.set_spent(item.spent.clone().into());
-        window.set_remaining(item.remaining.clone().into());
-        window.set_description(item.description.clone().into());
-        window.set_comments(item.comments.clone().into());
-        if window.show().is_ok() {
-            windows.borrow_mut().push(window);
+        let issue_url = format!(
+            "{}/browse/{}",
+            resource.url.trim_end_matches('/'),
+            selected_key
+        );
+        if let Err(error) = webbrowser::open(&issue_url) {
+            ui.set_action_status(format!("ブラウザでJira課題を開けません: {error}").into());
         }
     });
 
@@ -1336,11 +1348,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let weak = ui.as_weak();
     ui.on_choose_date(move |date| {
         if let Some(ui) = weak.upgrade() {
-            if ui.get_calendar_target() == "worklog" {
-                ui.set_worklog_date(date);
-            } else {
-                ui.set_selected_due(date);
-            }
+            ui.set_worklog_date(date);
             ui.set_show_calendar(false);
         }
     });
@@ -1353,110 +1361,6 @@ fn main() -> Result<(), slint::PlatformError> {
         {
             ui.set_action_status(error.into());
         }
-    });
-
-    let weak = ui.as_weak();
-    let all_for_save = issues.clone();
-    let resource_for_save = current_resource.clone();
-    let fields_for_save = custom_fields.clone();
-    let visible_for_save = visible_custom_ids.clone();
-    let session_for_save = active_session.clone();
-    let query_for_save = current_query.clone();
-    let parent_for_save = current_parent.clone();
-    let type_for_save = current_type.clone();
-    let collapsed_for_save = collapsed_nodes.clone();
-    ui.on_save_issue(move |key, summary, description, due, estimate| {
-        let Some(ui) = weak.upgrade() else { return };
-        if ui.get_action_busy() {
-            return;
-        }
-        let estimate_seconds = match parse_duration(estimate.as_str()) {
-            Ok(value) => value,
-            Err(error) => {
-                ui.set_action_status(error.into());
-                return;
-            }
-        };
-        if let Err(error) = validate_due(due.as_str()) {
-            ui.set_action_status(error.into());
-            return;
-        }
-        let Some(session) = session_for_save.lock().unwrap().clone() else {
-            ui.set_action_status("編集前に「再同期」でJiraへ接続してください。".into());
-            return;
-        };
-        if summary.trim().is_empty() {
-            ui.set_action_status("タイトルは空にできません。".into());
-            return;
-        }
-        ui.set_action_busy(true);
-        ui.set_action_status("課題を更新中...".into());
-        let weak_for_result = ui.as_weak();
-        let all_for_result = all_for_save.clone();
-        let resource_for_result = resource_for_save.clone();
-        let fields_for_result = fields_for_save.clone();
-        let visible_for_result = visible_for_save.clone();
-        let query_for_result = query_for_save.clone();
-        let parent_for_result = parent_for_save.clone();
-        let type_for_result = type_for_save.clone();
-        let collapsed_for_result = collapsed_for_save.clone();
-        let key = key.to_string();
-        let due = due.to_string();
-        std::thread::spawn(move || {
-            let result = jira::update_issue(
-                &session,
-                &key,
-                summary.as_str(),
-                description.as_str(),
-                &due,
-                estimate_seconds,
-            )
-            .and_then(|()| jira::fetch_all_issues(&session))
-            .map(|(resource, fetched, fields)| {
-                let cache_error = storage::replace_issues(&resource, &fetched, &fields).err();
-                (resource, fetched, fields, cache_error)
-            });
-            let _ = slint::invoke_from_event_loop(move || {
-                let Some(ui) = weak_for_result.upgrade() else {
-                    return;
-                };
-                ui.set_action_busy(false);
-                match result {
-                    Ok((resource, fetched, fields, cache_error)) => {
-                        *resource_for_result.lock().unwrap() = Some(resource.clone());
-                        *all_for_result.lock().unwrap() = fetched;
-                        *fields_for_result.lock().unwrap() = fields;
-                        let guard = all_for_result.lock().unwrap();
-                        let query = query_for_result.lock().unwrap().clone();
-                        let parent = parent_for_result.lock().unwrap().clone();
-                        let issue_type = type_for_result.lock().unwrap().clone();
-                        apply_custom_field_models(
-                            &ui,
-                            &fields_for_result.lock().unwrap(),
-                            &visible_for_result.lock().unwrap(),
-                        );
-                        apply_issue_models(
-                            &ui,
-                            &guard,
-                            &query,
-                            &parent,
-                            &issue_type,
-                            &collapsed_for_result.lock().unwrap(),
-                        );
-                        if let Some(item) = guard.iter().find(|item| item.key == key) {
-                            select_issue(&ui, item);
-                        }
-                        ui.set_action_status(
-                            cache_error
-                                .map(|error| format!("Jira更新済み・キャッシュ失敗: {error}"))
-                                .unwrap_or_else(|| "課題を更新しました。".into())
-                                .into(),
-                        );
-                    }
-                    Err(error) => ui.set_action_status(format!("更新エラー: {error}").into()),
-                }
-            });
-        });
     });
 
     let weak = ui.as_weak();
@@ -1680,6 +1584,32 @@ mod tests {
                 .depth,
             2
         );
+    }
+
+    #[test]
+    fn custom_boolean_and_flag_fields_keep_checkbox_metadata() {
+        let mut item = demo_issues().remove(0);
+        item.custom_values.insert("bool".into(), "true".into());
+        item.custom_values
+            .insert("flag".into(), "Impediment".into());
+        let fields = vec![
+            CustomField {
+                id: "bool".into(),
+                name: "Boolean".into(),
+                field_type: "boolean".into(),
+                editable: true,
+            },
+            CustomField {
+                id: "flag".into(),
+                name: "Flagged".into(),
+                field_type: "flag".into(),
+                editable: true,
+            },
+        ];
+        let row = to_row(&item, std::slice::from_ref(&item), &fields, &HashSet::new());
+        let cells = row.custom_cells.iter().collect::<Vec<_>>();
+        assert!(cells.iter().all(|cell| cell.boolean && cell.editable));
+        assert!(cells.iter().all(|cell| cell.checked));
     }
 
     #[test]

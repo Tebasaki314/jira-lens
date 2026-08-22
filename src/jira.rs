@@ -88,6 +88,7 @@ struct ApiField {
 struct ApiFieldSchema {
     #[serde(rename = "type")]
     field_type: String,
+    custom: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,41 +119,6 @@ struct CommentPage {
 #[derive(Deserialize)]
 struct ApiComment {
     body: Value,
-}
-
-pub fn update_issue(
-    session: &SavedSession,
-    issue_key: &str,
-    summary: &str,
-    description: &str,
-    due: &str,
-    estimate_seconds: i64,
-) -> Result<(), String> {
-    let resource = primary_resource(session)?;
-    let client = jira_client()?;
-    let endpoint = issue_endpoint(resource, issue_key);
-    let due_value = if due.trim().is_empty() {
-        Value::Null
-    } else {
-        Value::String(due.trim().to_owned())
-    };
-    let body = serde_json::json!({
-        "fields": {
-            "summary": summary.trim(),
-            "description": text_to_adf(description),
-            "duedate": due_value,
-            "timetracking": {
-                "originalEstimate": jira_duration(estimate_seconds)
-            }
-        }
-    });
-    send_without_response(
-        client
-            .put(endpoint)
-            .bearer_auth(&session.tokens.access_token)
-            .json(&body),
-        "Jira課題の更新",
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -212,6 +178,19 @@ pub fn update_issue_fields(
                     ));
                 }
             })
+        } else if field.field_type == "flag" {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => {
+                    serde_json::json!([{"value": "Impediment"}])
+                }
+                "false" | "0" | "no" | "off" | "" => serde_json::json!([]),
+                _ => {
+                    return Err(format!(
+                        "{} はチェックボックスで指定してください。",
+                        field.name
+                    ));
+                }
+            }
         } else {
             Value::String(value.to_string())
         };
@@ -228,23 +207,6 @@ pub fn update_issue_fields(
             .json(&body),
         "Jira課題の更新",
     )
-}
-
-fn text_to_adf(text: &str) -> Value {
-    let content = text
-        .lines()
-        .map(|line| {
-            if line.is_empty() {
-                serde_json::json!({"type": "paragraph"})
-            } else {
-                serde_json::json!({
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": line}]
-                })
-            }
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({"type": "doc", "version": 1, "content": content})
 }
 
 pub fn add_worklog(
@@ -408,16 +370,13 @@ fn fetch_custom_fields(
         .into_iter()
         .filter(|field| field.custom)
         .map(|field| {
-            let field_type = field
-                .schema
-                .map(|schema| schema.field_type)
-                .unwrap_or_default();
+            let field_type = api_field_type(&field);
             CustomField {
                 id: field.id,
                 name: field.name,
                 editable: matches!(
                     field_type.as_str(),
-                    "string" | "number" | "date" | "boolean"
+                    "string" | "number" | "date" | "boolean" | "flag"
                 ),
                 field_type,
             }
@@ -425,6 +384,25 @@ fn fetch_custom_fields(
         .collect::<Vec<_>>();
     fields.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(fields)
+}
+
+fn api_field_type(field: &ApiField) -> String {
+    let is_flag = field.name.eq_ignore_ascii_case("flagged")
+        || field.name == "フラグ"
+        || field
+            .schema
+            .as_ref()
+            .and_then(|schema| schema.custom.as_deref())
+            .is_some_and(|custom| custom.contains("gh-flag"));
+    if is_flag {
+        "flag".to_owned()
+    } else {
+        field
+            .schema
+            .as_ref()
+            .map(|schema| schema.field_type.clone())
+            .unwrap_or_default()
+    }
 }
 
 fn fetch_project_keys(
@@ -661,10 +639,6 @@ mod tests {
             {"type":"paragraph","content":[{"type":"text","text":"次の行"}]}
         ]});
         assert_eq!(adf_to_text(&adf), "最初の行\n次の行");
-        assert_eq!(
-            adf_to_text(&text_to_adf("最初の行\n次の行")),
-            "最初の行\n次の行"
-        );
     }
 
     #[test]
@@ -729,5 +703,20 @@ mod tests {
         assert_eq!(page.values.len(), 2);
         assert_eq!(page.values[1].key, "OPS");
         assert!(page.is_last);
+    }
+
+    #[test]
+    fn recognizes_jira_flagged_as_editable_checkbox_type() {
+        let field: ApiField = serde_json::from_value(serde_json::json!({
+            "id": "customfield_10021",
+            "name": "Flagged",
+            "custom": true,
+            "schema": {
+                "type": "array",
+                "custom": "com.pyxis.greenhopper.jira:gh-flag"
+            }
+        }))
+        .unwrap();
+        assert_eq!(api_field_type(&field), "flag");
     }
 }

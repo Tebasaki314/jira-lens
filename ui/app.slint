@@ -1,10 +1,11 @@
-import { Button, CheckBox, ComboBox, LineEdit, ListView, ScrollView, SpinBox, TextEdit } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ListView, ScrollView, SpinBox } from "std-widgets.slint";
 
 export struct CustomCell {
     field-id: string,
     value: string,
     editable: bool,
     boolean: bool,
+    checked: bool,
 }
 
 export struct IssueRow {
@@ -29,6 +30,7 @@ export struct CustomColumn {
     id: string,
     name: string,
     editable: bool,
+    field-type: string,
 }
 
 export struct TreeNode {
@@ -73,6 +75,28 @@ component PaneDivider inherits Rectangle {
         moved => {
             if (self.pressed) {
                 root.pane-size = (self.pressed-size + (self.mouse-x - self.pressed-x) * root.direction).clamp(root.minimum, root.maximum);
+            }
+        }
+    }
+}
+
+component ColumnDivider inherits Rectangle {
+    in-out property <length> column-width;
+    in property <length> minimum: 48px;
+    in property <length> maximum: 520px;
+    width: 6px;
+    background: drag.has-hover || drag.pressed ? #818cf8 : transparent;
+    drag := TouchArea {
+        property <length> pressed-width;
+        mouse-cursor: ew-resize;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                self.pressed-width = root.column-width;
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                root.column-width = (self.pressed-width + self.mouse-x - self.pressed-x).clamp(root.minimum, root.maximum);
             }
         }
     }
@@ -130,6 +154,9 @@ export component AppWindow inherits Window {
     in-out property <string> selected-summary: "課題一覧テーブル";
     in-out property <string> selected-description: "Excelのように見通しのよい一覧を作る";
     in-out property <string> selected-comments: "列の表示切替を追加";
+    in-out property <string> selected-issue-type: "タスク";
+    in-out property <string> selected-status: "進行中";
+    in-out property <string> selected-assignee: "";
     in-out property <string> selected-due: "2026-08-28";
     in-out property <string> selected-estimate: "12h";
     in-out property <string> selected-spent: "4h";
@@ -143,7 +170,6 @@ export component AppWindow inherits Window {
     in-out property <bool> show-remaining: true;
     in-out property <bool> show-calendar: false;
     in-out property <string> calendar-label: "";
-    in-out property <string> calendar-target: "due";
     in-out property <string> worklog-date: "";
     in-out property <string> worklog-time: "09:00";
     in-out property <int> worklog-minutes: 60;
@@ -158,6 +184,27 @@ export component AppWindow inherits Window {
     in-out property <length> right-pane-width: 330px;
     in-out property <bool> edit-mode: false;
     in-out property <bool> confirm-discard: false;
+    in-out property <length> issue-type-column-width: 96px;
+    in-out property <length> key-column-width: 112px;
+    in-out property <length> summary-column-width: 300px;
+    in-out property <length> status-column-width: 92px;
+    in-out property <length> assignee-column-width: 86px;
+    in-out property <length> due-column-width: 92px;
+    in-out property <length> estimate-column-width: 70px;
+    in-out property <length> spent-column-width: 70px;
+    in-out property <length> remaining-column-width: 70px;
+    in-out property <length> custom-column-width: 120px;
+    in property <length> table-content-width: 20px
+        + root.issue-type-column-width + 6px
+        + root.key-column-width + 6px
+        + root.summary-column-width + 6px
+        + root.status-column-width + 6px
+        + (root.show-assignee ? root.assignee-column-width + 6px : 0px)
+        + (root.show-due ? root.due-column-width + 6px : 0px)
+        + (root.show-estimate ? root.estimate-column-width + 6px : 0px)
+        + (root.show-spent ? root.spent-column-width + 6px : 0px)
+        + (root.show-remaining ? root.remaining-column-width + 6px : 0px)
+        + root.custom-columns.length * (root.custom-column-width + 6px);
     callback select-issue(string);
     callback search(string);
     callback filter-parent(string);
@@ -168,7 +215,6 @@ export component AppWindow inherits Window {
     callback filter-status(string);
     callback toggle-favorite(string);
     callback connect-oauth();
-    callback save-issue(string, string, string, string, string);
     callback columns-changed(bool, bool, bool, bool, bool);
     callback add-custom-column(string);
     callback remove-custom-column(string);
@@ -180,7 +226,7 @@ export component AppWindow inherits Window {
     callback calendar-previous();
     callback calendar-next();
     callback choose-date(string);
-    callback open-selected-issue();
+    callback open-issue-in-jira();
 
     VerticalLayout {
         spacing: 0px;
@@ -231,7 +277,7 @@ export component AppWindow inherits Window {
             PaneDivider { pane-size <=> root.left-pane-width; minimum: 180px; maximum: 480px; }
 
             Rectangle {
-                horizontal-stretch: 1; background: #f8fafc;
+                horizontal-stretch: 1; min-width: 0px; preferred-width: 360px; background: #f8fafc;
                 VerticalLayout {
                     padding: 14px; spacing: 10px;
                     HorizontalLayout {
@@ -260,62 +306,88 @@ export component AppWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        background: white; border-color: #e2e8f0; border-width: 1px; border-radius: 7px;
+                        min-width: 0px; preferred-width: 0px; clip: true; background: white; border-color: #e2e8f0; border-width: 1px; border-radius: 7px;
                         VerticalLayout {
                             spacing: 0px;
                             Rectangle {
-                                height: 36px; background: #f1f5f9;
-                                HorizontalLayout { padding-left: 10px; padding-right: 10px; spacing: 8px;
-                                    Text { width: 76px; text: "キー"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
-                                    Text { horizontal-stretch: 1; text: "タイトル"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
-                                    Text { width: 70px; text: "状態"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
-                                    Text { visible: root.show-assignee; width: 72px; text: "担当者"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
-                                    Text { visible: root.show-due; width: 88px; text: "期限"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
-                                    Text { visible: root.show-estimate; width: 54px; text: "見積"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
-                                    Text { visible: root.show-spent; width: 54px; text: "消費"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
-                                    Text { visible: root.show-remaining; width: 54px; text: "残余"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
-                                    for column in root.custom-columns : Text { width: 110px; text: column.name; font-weight: 700; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                                height: 36px; min-width: 0px; clip: true; background: #f1f5f9;
+                                HorizontalLayout { x: list.viewport-x; width: root.table-content-width; min-width: 0px; preferred-width: 0px; padding-left: 10px; padding-right: 10px; spacing: 0px;
+                                    Text { width: root.issue-type-column-width; text: "課題タイプ"; font-weight: 700; font-size: 11px; vertical-alignment: center; horizontal-alignment: left; }
+                                    ColumnDivider { column-width <=> root.issue-type-column-width; }
+                                    Text { width: root.key-column-width; text: "キー"; font-weight: 700; font-size: 11px; vertical-alignment: center; horizontal-alignment: left; }
+                                    ColumnDivider { column-width <=> root.key-column-width; minimum: 80px; }
+                                    Text { width: root.summary-column-width; text: "タイトル"; font-weight: 700; font-size: 11px; vertical-alignment: center; horizontal-alignment: left; }
+                                    ColumnDivider { column-width <=> root.summary-column-width; minimum: 120px; }
+                                    Text { width: root.status-column-width; text: "状態"; font-weight: 700; font-size: 11px; vertical-alignment: center; horizontal-alignment: left; }
+                                    ColumnDivider { column-width <=> root.status-column-width; }
+                                    Text { visible: root.show-assignee; width: root.assignee-column-width; text: "担当者"; font-weight: 700; font-size: 11px; vertical-alignment: center; horizontal-alignment: left; }
+                                    ColumnDivider { visible: root.show-assignee; column-width <=> root.assignee-column-width; }
+                                    Text { visible: root.show-due; width: root.due-column-width; text: "期限"; font-weight: 700; font-size: 11px; vertical-alignment: center; horizontal-alignment: left; }
+                                    ColumnDivider { visible: root.show-due; column-width <=> root.due-column-width; }
+                                    Text { visible: root.show-estimate; width: root.estimate-column-width; text: "見積"; font-weight: 700; font-size: 11px; vertical-alignment: center; horizontal-alignment: left; }
+                                    ColumnDivider { visible: root.show-estimate; column-width <=> root.estimate-column-width; }
+                                    Text { visible: root.show-spent; width: root.spent-column-width; text: "消費"; font-weight: 700; font-size: 11px; vertical-alignment: center; horizontal-alignment: left; }
+                                    ColumnDivider { visible: root.show-spent; column-width <=> root.spent-column-width; }
+                                    Text { visible: root.show-remaining; width: root.remaining-column-width; text: "残余"; font-weight: 700; font-size: 11px; vertical-alignment: center; horizontal-alignment: left; }
+                                    ColumnDivider { visible: root.show-remaining; column-width <=> root.remaining-column-width; }
+                                    for column in root.custom-columns : HorizontalLayout { spacing: 0px; Text { width: root.custom-column-width; text: column.name; font-weight: 700; font-size: 11px; vertical-alignment: center; horizontal-alignment: left; overflow: elide; } ColumnDivider { column-width <=> root.custom-column-width; } }
                                 }
                             }
                             list := ListView {
+                                min-width: 0px;
+                                preferred-width: 0px;
+                                viewport-width: root.table-content-width;
+                                horizontal-scrollbar-policy: as-needed;
                                 for issue in root.issues : Rectangle {
-                                    height: 42px; width: list.viewport-width;
+                                    height: 42px; width: root.table-content-width;
                                     background: issue.key == root.selected-key ? #e0e7ff : touch.has-hover ? #f8fafc : white;
                                     border-color: #eef2f7; border-width: 1px;
-                                    HorizontalLayout { padding-left: 10px; padding-right: 10px; spacing: 8px;
-                                        Rectangle { width: 76px; background: transparent;
-                                            Rectangle { x: issue.depth * 12px; y: 12px; width: 17px; height: 17px; visible: issue.has-children; border-color: #cbd5e1; border-width: 1px; border-radius: 3px;
+                                    HorizontalLayout { padding-left: 10px; padding-right: 10px; spacing: 0px;
+                                        Rectangle { width: root.issue-type-column-width; background: transparent; clip: true;
+                                            Rectangle { x: issue.depth * 10px; y: 12px; width: 17px; height: 17px; visible: issue.has-children; border-color: #cbd5e1; border-width: 1px; border-radius: 3px;
                                                 Text { text: issue.expanded ? "-" : "+"; horizontal-alignment: center; vertical-alignment: center; font-size: 11px; }
                                                 TouchArea { clicked => { root.toggle-tree(issue.key); } }
                                             }
-                                            Text { x: issue.depth * 12px + (issue.has-children ? 21px : 0px); width: parent.width - self.x; text: issue.key; color: #1d4ed8; font-size: 10px; vertical-alignment: center; overflow: elide; }
+                                            Rectangle { x: issue.depth * 10px + (issue.has-children ? 21px : 0px); y: 9px; width: parent.width - self.x - 4px; height: 24px; background: #dbeafe; border-radius: 7px;
+                                                Text { text: issue.issue-type; color: #1d4ed8; font-size: 9px; vertical-alignment: center; horizontal-alignment: left; overflow: elide; }
+                                            }
                                         }
-                                        Rectangle { horizontal-stretch: 1; background: transparent;
-                                            Text { visible: !root.edit-mode; text: issue.summary; color: #1e293b; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                                        Rectangle { width: 6px; background: transparent; }
+                                        Text { width: root.key-column-width; text: issue.key; color: #1d4ed8; font-size: 11px; font-weight: 600; vertical-alignment: center; horizontal-alignment: left; }
+                                        Rectangle { width: 6px; background: transparent; }
+                                        Rectangle { width: root.summary-column-width; background: transparent; clip: true;
+                                            Text { visible: !root.edit-mode; width: parent.width; text: issue.summary; color: #1e293b; font-size: 12px; vertical-alignment: center; horizontal-alignment: left; overflow: elide; }
                                             LineEdit { visible: root.edit-mode; width: parent.width; text: issue.summary; edited(value) => { root.edit-table-cell(issue.key, "summary", value); } }
                                         }
-                                        Rectangle { width: 70px; background: issue.status-done ? #dcfce7 : #e0e7ff; border-radius: 8px; Text { text: issue.issue-type + " / " + issue.status; color: issue.status-done ? #15803d : #475569; font-size: 9px; vertical-alignment: center; horizontal-alignment: center; overflow: elide; } }
-                                        Text { visible: root.show-assignee; width: 72px; text: issue.assignee; font-size: 11px; vertical-alignment: center; }
-                                        Rectangle { visible: root.show-due; width: 88px; background: transparent;
+                                        Rectangle { width: 6px; background: transparent; }
+                                        Rectangle { width: root.status-column-width; background: issue.status-done ? #dcfce7 : #e0e7ff; border-radius: 8px; Text { text: issue.status; color: issue.status-done ? #15803d : #475569; font-size: 10px; vertical-alignment: center; horizontal-alignment: left; overflow: elide; } }
+                                        Rectangle { width: 6px; background: transparent; }
+                                        Text { visible: root.show-assignee; width: root.assignee-column-width; text: issue.assignee; font-size: 11px; vertical-alignment: center; horizontal-alignment: left; overflow: elide; }
+                                        Rectangle { visible: root.show-assignee; width: 6px; background: transparent; }
+                                        Rectangle { visible: root.show-due; width: root.due-column-width; background: transparent;
                                             Text { visible: !root.edit-mode; text: issue.due; font-size: 11px; vertical-alignment: center; }
                                             LineEdit { visible: root.edit-mode; text: issue.due; edited(value) => { root.edit-table-cell(issue.key, "duedate", value); } }
                                         }
-                                        Rectangle { visible: root.show-estimate; width: 70px; background: transparent;
+                                        Rectangle { visible: root.show-due; width: 6px; background: transparent; }
+                                        Rectangle { visible: root.show-estimate; width: root.estimate-column-width; background: transparent;
                                             Text { visible: !root.edit-mode; text: issue.estimate; font-size: 11px; vertical-alignment: center; }
                                             LineEdit { visible: root.edit-mode; text: issue.estimate; edited(value) => { root.edit-table-cell(issue.key, "estimate", value); } }
                                         }
-                                        Text { visible: root.show-spent; width: 54px; text: issue.spent; font-size: 11px; vertical-alignment: center; }
-                                        Rectangle { visible: root.show-remaining; width: 70px; background: transparent;
+                                        Rectangle { visible: root.show-estimate; width: 6px; background: transparent; }
+                                        Text { visible: root.show-spent; width: root.spent-column-width; text: issue.spent; font-size: 11px; vertical-alignment: center; horizontal-alignment: left; }
+                                        Rectangle { visible: root.show-spent; width: 6px; background: transparent; }
+                                        Rectangle { visible: root.show-remaining; width: root.remaining-column-width; background: transparent;
                                             Text { visible: !root.edit-mode; text: issue.remaining; font-size: 11px; vertical-alignment: center; }
                                             LineEdit { visible: root.edit-mode; text: issue.remaining; edited(value) => { root.edit-table-cell(issue.key, "remaining", value); } }
                                         }
-                                        for cell in issue.custom-cells : Rectangle { width: 110px; background: transparent;
+                                        Rectangle { visible: root.show-remaining; width: 6px; background: transparent; }
+                                        for cell in issue.custom-cells : HorizontalLayout { spacing: 0px; Rectangle { width: root.custom-column-width; background: transparent;
                                             Text { visible: !root.edit-mode || !cell.editable; text: cell.value; font-size: 11px; vertical-alignment: center; overflow: elide; }
                                             LineEdit { visible: root.edit-mode && cell.editable && !cell.boolean; text: cell.value; edited(value) => { root.edit-table-cell(issue.key, cell.field-id, value); } }
-                                            boolean-editor := CheckBox { visible: root.edit-mode && cell.editable && cell.boolean; checked: cell.value == "true"; toggled => { root.edit-table-cell(issue.key, cell.field-id, self.checked ? "true" : "false"); } }
-                                        }
+                                            boolean-editor := CheckBox { visible: root.edit-mode && cell.editable && cell.boolean; checked: cell.checked; toggled => { root.edit-table-cell(issue.key, cell.field-id, self.checked ? "true" : "false"); } }
+                                        } Rectangle { width: 6px; background: transparent; } }
                                     }
-                                    touch := TouchArea { visible: !root.edit-mode; x: 76px; width: parent.width - self.x; clicked => { root.select-issue(issue.key); } }
+                                    touch := TouchArea { visible: !root.edit-mode; x: root.issue-type-column-width + 6px; width: parent.width - self.x; clicked => { root.select-issue(issue.key); } }
                                 }
                             }
                         }
@@ -332,18 +404,22 @@ export component AppWindow inherits Window {
                         padding: 14px; spacing: 10px;
                         HorizontalLayout { height: 32px; spacing: 6px;
                             Text { text: root.selected-key; color: #2563eb; font-size: 13px; font-weight: 700; vertical-alignment: center; horizontal-stretch: 1; }
-                            Button { text: "別ウィンドウ"; clicked => { root.open-selected-issue(); } }
+                            Button { text: "Jiraで開く"; clicked => { root.open-issue-in-jira(); } }
                         }
-                        LineEdit { text <=> root.selected-summary; }
-                        TextEdit { height: 92px; text <=> root.selected-description; wrap: word-wrap; }
+                        Text { text: root.selected-summary; color: #0f172a; font-size: 17px; font-weight: 700; wrap: word-wrap; horizontal-alignment: left; }
+                        Text { text: root.selected-issue-type + " / " + root.selected-status + (root.selected-assignee == "" ? "" : " / " + root.selected-assignee); color: #64748b; font-size: 11px; wrap: word-wrap; horizontal-alignment: left; }
+                        Text { text: root.selected-description == "" ? "本文なし" : root.selected-description; color: #334155; font-size: 12px; wrap: word-wrap; horizontal-alignment: left; }
+                        Text { text: "課題内容の編集は、一覧の編集モードまたはJira画面で行ってください。"; color: #64748b; font-size: 10px; wrap: word-wrap; }
                         Rectangle { height: 1px; background: #e2e8f0; }
                         SectionTitle { text: "時間管理"; height: 24px; }
-                        Text { text: "初期見積もり"; font-size: 11px; color: #64748b; }
-                        LineEdit { text <=> root.selected-estimate; }
-                        Text { text: "期限"; font-size: 11px; color: #64748b; }
+                        Text { text: "期限: " + (root.selected-due == "" ? "未設定" : root.selected-due); font-size: 11px; color: #475569; }
+                        Text { text: "初期見積: " + root.selected-estimate + " / 消費: " + root.selected-spent + " / 残余: " + root.selected-remaining; font-size: 11px; color: #475569; wrap: word-wrap; }
+                        Rectangle { height: 1px; background: #e2e8f0; }
+                        SectionTitle { text: "作業時間を記録"; height: 24px; }
+                        Text { text: "作業開始日時"; font-size: 11px; color: #64748b; }
                         HorizontalLayout { height: 32px; spacing: 6px;
-                            Button { horizontal-stretch: 1; text: root.selected-due == "" ? "未設定" : root.selected-due; clicked => { root.calendar-target = "due"; root.show-calendar = !root.show-calendar; } }
-                            Button { width: 70px; text: "クリア"; clicked => { root.selected-due = ""; } }
+                            Button { horizontal-stretch: 1; text: root.worklog-date; clicked => { root.show-calendar = !root.show-calendar; } }
+                            LineEdit { width: 76px; text <=> root.worklog-time; placeholder-text: "09:00"; }
                         }
                         Rectangle {
                             visible: root.show-calendar;
@@ -362,14 +438,6 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                        }
-                        Button { enabled: !root.action-busy && root.selected-key != ""; text: root.action-busy ? "更新中..." : "課題を保存"; primary: true; clicked => { root.save-issue(root.selected-key, root.selected-summary, root.selected-description, root.selected-due, root.selected-estimate); } }
-                        Rectangle { height: 1px; background: #e2e8f0; }
-                        SectionTitle { text: "作業時間を記録"; height: 24px; }
-                        Text { text: "作業開始日時"; font-size: 11px; color: #64748b; }
-                        HorizontalLayout { height: 32px; spacing: 6px;
-                            Button { horizontal-stretch: 1; text: root.worklog-date; clicked => { root.calendar-target = "worklog"; root.show-calendar = true; } }
-                            LineEdit { width: 76px; text <=> root.worklog-time; placeholder-text: "09:00"; }
                         }
                         Text { text: "作業時間（分）"; font-size: 11px; color: #64748b; }
                         SpinBox { value <=> root.worklog-minutes; minimum: 1; maximum: 1440; }
@@ -398,52 +466,6 @@ export component AppWindow inherits Window {
                     Button { text: "変更を破棄"; clicked => { root.confirm-discard = false; root.discard-table-edit(); } }
                 }
             }
-        }
-    }
-}
-
-export component IssueDetailWindow inherits Window {
-    in property <string> issue-key;
-    in property <string> summary;
-    in property <string> issue-type;
-    in property <string> status;
-    in property <string> assignee;
-    in property <string> due;
-    in property <string> estimate;
-    in property <string> spent;
-    in property <string> remaining;
-    in property <string> description;
-    in property <string> comments;
-
-    title: "Jira Lens - " + root.issue-key;
-    preferred-width: 700px;
-    preferred-height: 620px;
-    min-width: 420px;
-    min-height: 360px;
-    background: #f8fafc;
-
-    ScrollView {
-        VerticalLayout {
-            padding: 20px; spacing: 12px;
-            Text { text: root.issue-key; color: #2563eb; font-size: 14px; font-weight: 700; }
-            Text { text: root.summary; color: #0f172a; font-size: 21px; font-weight: 700; wrap: word-wrap; }
-            HorizontalLayout { height: 28px; spacing: 18px;
-                Text { text: "タイプ: " + root.issue-type; color: #475569; }
-                Text { text: "状態: " + root.status; color: #475569; }
-                Text { text: "担当: " + root.assignee; color: #475569; }
-            }
-            HorizontalLayout { height: 28px; spacing: 18px;
-                Text { text: "期限: " + (root.due == "" ? "未設定" : root.due); color: #475569; }
-                Text { text: "見積: " + root.estimate; color: #475569; }
-                Text { text: "消費: " + root.spent; color: #475569; }
-                Text { text: "残余: " + root.remaining; color: #475569; }
-            }
-            Rectangle { height: 1px; background: #cbd5e1; }
-            SectionTitle { text: "本文"; height: 28px; }
-            Text { text: root.description; color: #334155; font-size: 13px; wrap: word-wrap; }
-            Rectangle { height: 1px; background: #cbd5e1; }
-            SectionTitle { text: "コメント"; height: 28px; }
-            Text { text: root.comments; color: #334155; font-size: 13px; wrap: word-wrap; }
         }
     }
 }
