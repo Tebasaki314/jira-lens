@@ -1,5 +1,6 @@
 use crate::Issue;
 use crate::oauth::{JiraResource, SavedSession};
+use chrono::{Local, NaiveDateTime, TimeZone};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -93,16 +94,140 @@ struct ApiComment {
     body: Value,
 }
 
-pub fn fetch_all_issues(session: &SavedSession) -> Result<(JiraResource, Vec<Issue>), String> {
-    let resource = session
+pub fn update_issue(
+    session: &SavedSession,
+    issue_key: &str,
+    summary: &str,
+    description: &str,
+    due: &str,
+    estimate_seconds: i64,
+) -> Result<(), String> {
+    let resource = primary_resource(session)?;
+    let client = jira_client()?;
+    let endpoint = issue_endpoint(resource, issue_key);
+    let due_value = if due.trim().is_empty() {
+        Value::Null
+    } else {
+        Value::String(due.trim().to_owned())
+    };
+    let body = serde_json::json!({
+        "fields": {
+            "summary": summary.trim(),
+            "description": text_to_adf(description),
+            "duedate": due_value,
+            "timetracking": {
+                "originalEstimate": jira_duration(estimate_seconds)
+            }
+        }
+    });
+    send_without_response(
+        client
+            .put(endpoint)
+            .bearer_auth(&session.tokens.access_token)
+            .json(&body),
+        "Jira課題の更新",
+    )
+}
+
+fn text_to_adf(text: &str) -> Value {
+    let content = text
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                serde_json::json!({"type": "paragraph"})
+            } else {
+                serde_json::json!({
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": line}]
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({"type": "doc", "version": 1, "content": content})
+}
+
+pub fn add_worklog(
+    session: &SavedSession,
+    issue_key: &str,
+    date: &str,
+    time: &str,
+    minutes: i32,
+) -> Result<(), String> {
+    if !(1..=1440).contains(&minutes) {
+        return Err("作業時間は1〜1440分で指定してください。".into());
+    }
+    let naive = NaiveDateTime::parse_from_str(
+        &format!("{} {}", date.trim(), time.trim()),
+        "%Y-%m-%d %H:%M",
+    )
+    .map_err(|_| "開始日時は YYYY-MM-DD と HH:MM の形式で入力してください。".to_owned())?;
+    let started = Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .ok_or_else(|| "指定された開始日時をローカル時刻へ変換できません。".to_owned())?
+        .format("%Y-%m-%dT%H:%M:%S.000%z")
+        .to_string();
+    let resource = primary_resource(session)?;
+    let client = jira_client()?;
+    let endpoint = format!("{}/worklog", issue_endpoint(resource, issue_key));
+    let body = serde_json::json!({
+        "started": started,
+        "timeSpentSeconds": i64::from(minutes) * 60
+    });
+    send_without_response(
+        client
+            .post(endpoint)
+            .bearer_auth(&session.tokens.access_token)
+            .json(&body),
+        "Jira作業時間の登録",
+    )
+}
+
+fn primary_resource(session: &SavedSession) -> Result<&JiraResource, String> {
+    session
         .resources
         .first()
-        .cloned()
-        .ok_or_else(|| "利用可能なJiraサイトがありません。".to_owned())?;
-    let client = Client::builder()
+        .ok_or_else(|| "利用可能なJiraサイトがありません。".to_owned())
+}
+
+fn jira_client() -> Result<Client, String> {
+    Client::builder()
         .timeout(Duration::from_secs(45))
         .build()
-        .map_err(|error| format!("Jira HTTPクライアントを作成できません: {error}"))?;
+        .map_err(|error| format!("Jira HTTPクライアントを作成できません: {error}"))
+}
+
+fn issue_endpoint(resource: &JiraResource, issue_key: &str) -> String {
+    format!(
+        "https://api.atlassian.com/ex/jira/{}/rest/api/3/issue/{}",
+        resource.id, issue_key
+    )
+}
+
+fn send_without_response(
+    request: reqwest::blocking::RequestBuilder,
+    action: &str,
+) -> Result<(), String> {
+    let response = request
+        .header("Accept", "application/json")
+        .send()
+        .map_err(|error| format!("{action}に失敗しました: {error}"))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = response.text().unwrap_or_default();
+    Err(format!("{action}に失敗しました ({status}): {body}"))
+}
+
+fn jira_duration(seconds: i64) -> String {
+    let minutes = seconds.max(0).saturating_add(59) / 60;
+    format!("{minutes}m")
+}
+
+pub fn fetch_all_issues(session: &SavedSession) -> Result<(JiraResource, Vec<Issue>), String> {
+    let resource = primary_resource(session)?.clone();
+    let client = jira_client()?;
     let project_keys = fetch_project_keys(&client, &resource, &session.tokens.access_token)?;
     let fields = [
         "summary",
@@ -249,6 +374,8 @@ impl From<ApiIssue> for Issue {
             due: fields.duedate.unwrap_or_default(),
             estimate: format_duration(fields.timeoriginalestimate),
             spent: format_duration(fields.timespent),
+            estimate_seconds: fields.timeoriginalestimate.unwrap_or(0),
+            spent_seconds: fields.timespent.unwrap_or(0),
             parent: fields.parent.map(|parent| parent.key).unwrap_or_default(),
             description: fields
                 .description
@@ -316,12 +443,17 @@ mod tests {
             {"type":"paragraph","content":[{"type":"text","text":"次の行"}]}
         ]});
         assert_eq!(adf_to_text(&adf), "最初の行\n次の行");
+        assert_eq!(
+            adf_to_text(&text_to_adf("最初の行\n次の行")),
+            "最初の行\n次の行"
+        );
     }
 
     #[test]
     fn formats_jira_seconds() {
         assert_eq!(format_duration(Some(5 * 3600 + 30 * 60)), "5h 30m");
         assert_eq!(format_duration(None), "0h");
+        assert_eq!(jira_duration(90), "2m");
     }
 
     #[test]

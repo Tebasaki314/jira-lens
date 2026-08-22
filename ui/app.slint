@@ -1,4 +1,4 @@
-import { Button, CheckBox, LineEdit, ListView, ScrollView, SpinBox } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ListView, ScrollView, SpinBox, TextEdit } from "std-widgets.slint";
 
 export struct IssueRow {
     key: string,
@@ -15,6 +15,20 @@ export struct TreeNode {
     key: string,
     label: string,
     depth: int,
+}
+
+export struct CalendarDay {
+    label: string,
+    date: string,
+    row: int,
+    column: int,
+    current-month: bool,
+}
+
+export struct BurndownPoint {
+    label: string,
+    remaining: string,
+    height: int,
 }
 
 component SectionTitle inherits Text {
@@ -44,6 +58,8 @@ export component AppWindow inherits Window {
 
     in property <[IssueRow]> issues;
     in property <[TreeNode]> tree-nodes;
+    in property <[CalendarDay]> calendar-days;
+    in property <[BurndownPoint]> burndown-points;
     in-out property <string> selected-key: "APP-102";
     in-out property <string> selected-summary: "課題一覧テーブル";
     in-out property <string> selected-description: "Excelのように見通しのよい一覧を作る";
@@ -58,6 +74,15 @@ export component AppWindow inherits Window {
     in-out property <bool> show-estimate: true;
     in-out property <bool> show-spent: true;
     in-out property <bool> show-calendar: false;
+    in-out property <string> calendar-label: "";
+    in-out property <string> calendar-target: "due";
+    in-out property <string> worklog-date: "";
+    in-out property <string> worklog-time: "09:00";
+    in-out property <int> worklog-minutes: 60;
+    in-out property <string> action-status: "";
+    in-out property <bool> action-busy: false;
+    in-out property <string> burndown-title: "バーンダウン";
+    in-out property <string> burndown-summary: "履歴データなし";
     in-out property <bool> connection-busy: false;
     in-out property <bool> has-synced-data: false;
     in-out property <string> connection-status: "未接続";
@@ -65,6 +90,12 @@ export component AppWindow inherits Window {
     callback search(string);
     callback filter-parent(string);
     callback connect-oauth();
+    callback save-issue(string, string, string, string, string);
+    callback columns-changed(bool, bool, bool, bool);
+    callback log-work(string, string, string, int);
+    callback calendar-previous();
+    callback calendar-next();
+    callback choose-date(string);
 
     VerticalLayout {
         spacing: 0px;
@@ -117,10 +148,10 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             padding-left: 10px; padding-right: 10px; spacing: 12px;
                             Text { text: "表示列"; font-size: 11px; vertical-alignment: center; color: #475569; }
-                            CheckBox { text: "担当者"; checked <=> root.show-assignee; }
-                            CheckBox { text: "期限"; checked <=> root.show-due; }
-                            CheckBox { text: "見積"; checked <=> root.show-estimate; }
-                            CheckBox { text: "消費"; checked <=> root.show-spent; }
+                            CheckBox { text: "担当者"; checked <=> root.show-assignee; toggled => { root.columns-changed(root.show-assignee, root.show-due, root.show-estimate, root.show-spent); } }
+                            CheckBox { text: "期限"; checked <=> root.show-due; toggled => { root.columns-changed(root.show-assignee, root.show-due, root.show-estimate, root.show-spent); } }
+                            CheckBox { text: "見積"; checked <=> root.show-estimate; toggled => { root.columns-changed(root.show-assignee, root.show-due, root.show-estimate, root.show-spent); } }
+                            CheckBox { text: "消費"; checked <=> root.show-spent; toggled => { root.columns-changed(root.show-assignee, root.show-due, root.show-estimate, root.show-spent); } }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
                         }
                     }
@@ -168,45 +199,59 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         padding: 14px; spacing: 10px;
                         Text { text: root.selected-key; color: #2563eb; font-size: 13px; font-weight: 700; }
-                        Text { text: root.selected-summary; color: #0f172a; font-size: 17px; font-weight: 700; wrap: word-wrap; }
-                        Text { text: root.selected-description; color: #475569; font-size: 12px; wrap: word-wrap; }
+                        LineEdit { text <=> root.selected-summary; }
+                        TextEdit { height: 92px; text <=> root.selected-description; wrap: word-wrap; }
                         Rectangle { height: 1px; background: #e2e8f0; }
                         SectionTitle { text: "時間管理"; height: 24px; }
                         Text { text: "初期見積もり"; font-size: 11px; color: #64748b; }
                         LineEdit { text <=> root.selected-estimate; }
-                        Text { text: "作業開始日時"; font-size: 11px; color: #64748b; }
+                        Text { text: "期限"; font-size: 11px; color: #64748b; }
                         HorizontalLayout { height: 32px; spacing: 6px;
-                            Button { horizontal-stretch: 1; text: root.selected-due; clicked => { root.show-calendar = !root.show-calendar; } }
-                            Button { width: 70px; text: "09:00"; }
+                            Button { horizontal-stretch: 1; text: root.selected-due == "" ? "未設定" : root.selected-due; clicked => { root.calendar-target = "due"; root.show-calendar = !root.show-calendar; } }
+                            Button { width: 70px; text: "クリア"; clicked => { root.selected-due = ""; } }
                         }
                         Rectangle {
                             visible: root.show-calendar;
-                            height: 190px; background: #f8fafc; border-color: #cbd5e1; border-width: 1px; border-radius: 6px;
+                            height: 226px; background: #f8fafc; border-color: #cbd5e1; border-width: 1px; border-radius: 6px;
                             VerticalLayout { padding: 8px; spacing: 5px;
-                                HorizontalLayout { height: 28px; Button { text: "‹"; } Text { text: "2026年 8月"; horizontal-stretch: 1; horizontal-alignment: center; vertical-alignment: center; font-weight: 700; } Button { text: "›"; } }
+                                HorizontalLayout { height: 28px; Button { text: "‹"; clicked => { root.calendar-previous(); } } Text { text: root.calendar-label; horizontal-stretch: 1; horizontal-alignment: center; vertical-alignment: center; font-weight: 700; } Button { text: "›"; clicked => { root.calendar-next(); } } }
                                 Text { text: " 日　月　火　水　木　金　土"; horizontal-alignment: center; color: #64748b; font-size: 11px; }
-                                Text { text: "　　　　　　　　1"; horizontal-alignment: center; font-size: 12px; }
-                                Text { text: " 2　 3　 4　 5　 6　 7　 8"; horizontal-alignment: center; font-size: 12px; }
-                                Text { text: " 9　10　11　12　13　14　15"; horizontal-alignment: center; font-size: 12px; }
-                                Text { text: "16　17　18　19　20　21　22"; horizontal-alignment: center; font-size: 12px; }
-                                Text { text: "23　24　25　26　27　28　29"; horizontal-alignment: center; font-size: 12px; color: #1d4ed8; font-weight: 700; }
-                                Text { text: "30　31"; horizontal-alignment: left; font-size: 12px; }
+                                GridLayout {
+                                    height: 168px;
+                                    spacing: 2px;
+                                    for day in root.calendar-days : Button {
+                                        row: day.row; col: day.column;
+                                        text: day.label;
+                                        enabled: day.current-month;
+                                        clicked => { root.choose-date(day.date); }
+                                    }
+                                }
                             }
                         }
+                        Button { enabled: !root.action-busy && root.selected-key != ""; text: root.action-busy ? "更新中…" : "課題を保存"; primary: true; clicked => { root.save-issue(root.selected-key, root.selected-summary, root.selected-description, root.selected-due, root.selected-estimate); } }
+                        Rectangle { height: 1px; background: #e2e8f0; }
+                        SectionTitle { text: "作業時間を記録"; height: 24px; }
+                        Text { text: "作業開始日時"; font-size: 11px; color: #64748b; }
+                        HorizontalLayout { height: 32px; spacing: 6px;
+                            Button { horizontal-stretch: 1; text: root.worklog-date; clicked => { root.calendar-target = "worklog"; root.show-calendar = true; } }
+                            LineEdit { width: 76px; text <=> root.worklog-time; placeholder-text: "09:00"; }
+                        }
                         Text { text: "作業時間（分）"; font-size: 11px; color: #64748b; }
-                        SpinBox { value: 60; minimum: 0; maximum: 1440; }
-                        Button { text: "作業時間を記録"; primary: true; }
+                        SpinBox { value <=> root.worklog-minutes; minimum: 1; maximum: 1440; }
+                        Button { enabled: !root.action-busy && root.selected-key != ""; text: root.action-busy ? "登録中…" : "作業時間を記録"; primary: true; clicked => { root.log-work(root.selected-key, root.worklog-date, root.worklog-time, root.worklog-minutes); } }
+                        Text { visible: root.action-status != ""; text: root.action-status; wrap: word-wrap; font-size: 11px; color: #475569; }
                         Text { text: "記録済み: " + root.selected-spent; font-size: 11px; color: #64748b; }
                         Rectangle { height: 1px; background: #e2e8f0; }
-                        SectionTitle { text: "バーンダウン（APP-100）"; height: 24px; }
-                        Text { text: "残り 28h / 40h"; font-size: 12px; color: #475569; }
+                        SectionTitle { text: root.burndown-title; height: 24px; }
+                        Text { text: root.burndown-summary; font-size: 12px; color: #475569; }
                         Rectangle {
                             height: 132px; background: #f8fafc; border-radius: 6px;
                             HorizontalLayout { padding: 12px; spacing: 10px; alignment: end;
-                                for point in [{v: 102, l: "8/22"}, {v: 94, l: "8/24"}, {v: 84, l: "8/26"}, {v: 70, l: "8/28"}, {v: 58, l: "8/30"}, {v: 46, l: "9/1"}] : VerticalLayout {
+                                for point in root.burndown-points : VerticalLayout {
                                     alignment: end; spacing: 3px;
-                                    Rectangle { width: 24px; height: point.v * 1px; background: #6366f1; border-radius: 3px; }
-                                    Text { text: point.l; font-size: 8px; color: #64748b; horizontal-alignment: center; }
+                                    Text { text: point.remaining; font-size: 8px; color: #475569; horizontal-alignment: center; }
+                                    Rectangle { width: 24px; height: point.height * 1px; background: #6366f1; border-radius: 3px; }
+                                    Text { text: point.label; font-size: 8px; color: #64748b; horizontal-alignment: center; }
                                 }
                             }
                         }

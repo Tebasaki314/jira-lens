@@ -1,10 +1,11 @@
 [package]
 name = "jira-lens"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 build = "build.rs"
 
 [dependencies]
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 directories = "6.0.0"
 keyring = "4.1.6"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "query", "rustls"] }
