@@ -33,7 +33,7 @@ export JIRA_OAUTH_REDIRECT_URI="http://127.0.0.1:53682/callback"
 cargo run
 ```
 
-Secretはソースコード、Git、設定ファイルへ保存しないでください。短命のOAuthアクセストークンとサイト情報はメモリだけに保持し、ローテーション方式のリフレッシュトークンだけをmacOS KeychainまたはWindows Credential Managerへ保存します。
+Secretはソースコード、Git、設定ファイルへ保存しないでください。短命のOAuthアクセストークンとサイト情報はメモリだけに保持し、ローテーション方式のリフレッシュトークンだけをmacOS KeychainまたはWindows Credential Managerへ保存します。Windows Credential Managerの1項目あたりのサイズ制限に対応するため、長いトークンは複数の資格情報へ分割します。
 
 公開配布版では利用者ごとに3LOアプリを作らせず、一つの登録済みOAuthアプリとHTTPSコールバックサービスを使用します。デスクトップバイナリへClient Secretを埋め込まないための認証ブローカーは今後の配布工程で追加します。
 

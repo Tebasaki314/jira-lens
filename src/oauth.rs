@@ -16,6 +16,10 @@ const RESOURCES_URL: &str = "https://api.atlassian.com/oauth/token/accessible-re
 const SCOPES: &str = "read:jira-work write:jira-work offline_access";
 const KEYRING_SERVICE: &str = "com.tebasaki314.jira-lens";
 const KEYRING_ACCOUNT: &str = "atlassian-oauth";
+const KEYRING_PARTS_ACCOUNT: &str = "atlassian-oauth-parts";
+const KEYRING_PART_PREFIX: &str = "atlassian-oauth-part";
+const CREDENTIAL_CHUNK_UTF16_LIMIT: usize = 1000;
+const MAX_CREDENTIAL_CHUNKS: usize = 64;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Clone, Debug)]
@@ -351,25 +355,67 @@ fn fetch_resources(client: &Client, access_token: &str) -> Result<Vec<JiraResour
 }
 
 fn refresh_token_to_store(tokens: &TokenSet) -> Result<&str, OAuthError> {
-    let refresh_token = tokens.refresh_token.as_deref().ok_or_else(|| {
-        OAuthError("Atlassianからリフレッシュトークンが返されませんでした。".into())
-    })?;
-    if refresh_token.encode_utf16().count() > 2500 {
-        return Err(OAuthError(
-            "リフレッシュトークンがWindows Credential Managerの上限を超えています。".into(),
-        ));
-    }
-    Ok(refresh_token)
+    tokens
+        .refresh_token
+        .as_deref()
+        .ok_or_else(|| OAuthError("Atlassianからリフレッシュトークンが返されませんでした。".into()))
 }
 
 fn save_refresh_token(tokens: &TokenSet) -> Result<(), OAuthError> {
     let refresh_token = refresh_token_to_store(tokens)?;
-    Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-        .and_then(|entry| entry.set_password(refresh_token))
-        .map_err(|error| OAuthError(format!("OS資格情報ストアへ保存できません: {error}")))
+    let chunks = split_credential_value(refresh_token);
+    if chunks.len() > MAX_CREDENTIAL_CHUNKS {
+        return Err(OAuthError(
+            "リフレッシュトークンが資格情報ストアへ保存できる最大サイズを超えています。".into(),
+        ));
+    }
+
+    let previous_count = stored_chunk_count().unwrap_or(0);
+    for (index, chunk) in chunks.iter().enumerate() {
+        let account = format!("{KEYRING_PART_PREFIX}-{index}");
+        Entry::new(KEYRING_SERVICE, &account)
+            .and_then(|entry| entry.set_password(chunk))
+            .map_err(|error| {
+                OAuthError(format!(
+                    "OS資格情報ストアへトークンの一部を保存できません ({}/{}) : {error}",
+                    index + 1,
+                    chunks.len()
+                ))
+            })?;
+    }
+    Entry::new(KEYRING_SERVICE, KEYRING_PARTS_ACCOUNT)
+        .and_then(|entry| entry.set_password(&chunks.len().to_string()))
+        .map_err(|error| OAuthError(format!("OS資格情報ストアへ保存できません: {error}")))?;
+
+    for index in chunks.len()..previous_count {
+        let account = format!("{KEYRING_PART_PREFIX}-{index}");
+        if let Ok(entry) = Entry::new(KEYRING_SERVICE, &account) {
+            let _ = entry.delete_credential();
+        }
+    }
+    if let Ok(legacy) = Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT) {
+        let _ = legacy.delete_credential();
+    }
+    Ok(())
 }
 
 fn load_refresh_token() -> Option<String> {
+    if let Some(count) = stored_chunk_count()
+        && (1..=MAX_CREDENTIAL_CHUNKS).contains(&count)
+    {
+        let mut token = String::new();
+        for index in 0..count {
+            let account = format!("{KEYRING_PART_PREFIX}-{index}");
+            token.push_str(
+                &Entry::new(KEYRING_SERVICE, &account)
+                    .ok()?
+                    .get_password()
+                    .ok()?,
+            );
+        }
+        return Some(token);
+    }
+
     let stored = Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
         .ok()?
         .get_password()
@@ -383,6 +429,37 @@ fn load_refresh_token() -> Option<String> {
     } else {
         Some(stored)
     }
+}
+
+fn stored_chunk_count() -> Option<usize> {
+    Entry::new(KEYRING_SERVICE, KEYRING_PARTS_ACCOUNT)
+        .ok()?
+        .get_password()
+        .ok()?
+        .parse()
+        .ok()
+}
+
+fn split_credential_value(value: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_utf16_len = 0;
+
+    for character in value.chars() {
+        let character_utf16_len = character.len_utf16();
+        if current_utf16_len + character_utf16_len > CREDENTIAL_CHUNK_UTF16_LIMIT
+            && !current.is_empty()
+        {
+            chunks.push(std::mem::take(&mut current));
+            current_utf16_len = 0;
+        }
+        current.push(character);
+        current_utf16_len += character_utf16_len;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn http_error(error: reqwest::Error) -> OAuthError {
@@ -431,6 +508,19 @@ mod tests {
             refresh_token_to_store(&tokens).unwrap(),
             "small-refresh-token"
         );
+    }
+
+    #[test]
+    fn long_refresh_token_is_split_below_windows_limit_and_reassembled() {
+        let token = format!("{}{}", "a".repeat(5999), "🚀");
+        let chunks = split_credential_value(&token);
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.encode_utf16().count() <= CREDENTIAL_CHUNK_UTF16_LIMIT)
+        );
+        assert_eq!(chunks.concat(), token);
     }
 
     #[test]
