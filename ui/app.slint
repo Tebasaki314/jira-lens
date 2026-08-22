@@ -51,9 +51,12 @@ export component AppWindow inherits Window {
     in-out property <bool> show-estimate: true;
     in-out property <bool> show-spent: true;
     in-out property <bool> show-calendar: false;
+    in-out property <bool> connection-busy: false;
+    in-out property <string> connection-status: "未接続";
     callback select-issue(string);
     callback search(string);
     callback filter-parent(string);
+    callback connect-oauth();
 
     VerticalLayout {
         spacing: 0px;
@@ -64,8 +67,8 @@ export component AppWindow inherits Window {
                 padding-left: 18px; padding-right: 18px; spacing: 14px;
                 Text { text: "Jira Lens"; color: white; font-size: 19px; font-weight: 700; vertical-alignment: center; }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
-                Text { text: "DEMO・ローカル表示"; color: #c7d2fe; font-size: 12px; vertical-alignment: center; }
-                Button { text: "Jiraに接続"; }
+                Text { text: root.connection-status; color: #c7d2fe; font-size: 12px; vertical-alignment: center; }
+                Button { enabled: !root.connection-busy; text: root.connection-busy ? "接続中…" : "Jiraに接続"; clicked => { root.connect-oauth(); } }
             }
         }
 

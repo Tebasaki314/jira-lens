@@ -1,3 +1,5 @@
+mod oauth;
+
 use slint::{Model, ModelRc, SharedString, VecModel};
 use std::rc::Rc;
 
@@ -158,6 +160,35 @@ fn main() -> Result<(), slint::PlatformError> {
     let issues = Rc::new(demo_issues());
     let rows = Rc::new(VecModel::from(filtered_rows(&issues, "", "")));
     ui.set_issues(ModelRc::from(rows.clone()));
+
+    let weak = ui.as_weak();
+    ui.on_connect_oauth(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_connection_busy() {
+            return;
+        }
+        ui.set_connection_busy(true);
+        ui.set_connection_status("ブラウザでAtlassianの認可を完了してください".into());
+        let weak_for_result = ui.as_weak();
+        std::thread::spawn(move || {
+            let result = oauth::connect();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak_for_result.upgrade() else {
+                    return;
+                };
+                ui.set_connection_busy(false);
+                match result {
+                    Ok(session) => {
+                        let site = &session.resources[0];
+                        ui.set_connection_status(format!("接続済み: {}", site.name).into());
+                    }
+                    Err(error) => {
+                        ui.set_connection_status(format!("接続エラー: {error}").into());
+                    }
+                }
+            });
+        });
+    });
 
     let weak = ui.as_weak();
     let issues_for_select = issues.clone();
