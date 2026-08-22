@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
@@ -207,11 +207,7 @@ fn wait_for_callback(
     while started.elapsed() < CALLBACK_TIMEOUT {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let mut buffer = [0_u8; 8192];
-                let size = stream.read(&mut buffer).map_err(|error| {
-                    OAuthError(format!("コールバックの読取に失敗しました: {error}"))
-                })?;
-                let request = String::from_utf8_lossy(&buffer[..size]);
+                let request = read_callback_request(&mut stream)?;
                 let target = request
                     .lines()
                     .next()
@@ -259,6 +255,30 @@ fn wait_for_callback(
     Err(OAuthError(
         "OAuth認可が3分以内に完了しませんでした。".into(),
     ))
+}
+
+fn read_callback_request(stream: &mut TcpStream) -> Result<String, OAuthError> {
+    // Windowsではnon-blocking listenerからacceptしたsocketもnon-blockingになり得る。
+    // ブラウザがHTTP要求を書き終えるまで待てるよう、受付後のsocketだけblockingへ戻す。
+    stream.set_nonblocking(false).map_err(|error| {
+        OAuthError(format!("コールバックソケットの設定に失敗しました: {error}"))
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| {
+            OAuthError(format!(
+                "コールバックのタイムアウト設定に失敗しました: {error}"
+            ))
+        })?;
+
+    let mut buffer = [0_u8; 8192];
+    let size = stream
+        .read(&mut buffer)
+        .map_err(|error| OAuthError(format!("コールバックの読取に失敗しました: {error}")))?;
+    if size == 0 {
+        return Err(OAuthError("空のOAuthコールバックを受信しました。".into()));
+    }
+    Ok(String::from_utf8_lossy(&buffer[..size]).into_owned())
 }
 
 fn respond(stream: &mut impl Write, status: u16, message: &str) {
@@ -372,6 +392,7 @@ fn http_error(error: reqwest::Error) -> OAuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpStream;
 
     fn config() -> OAuthConfig {
         OAuthConfig {
@@ -410,5 +431,35 @@ mod tests {
             refresh_token_to_store(&tokens).unwrap(),
             "small-refresh-token"
         );
+    }
+
+    #[test]
+    fn accepted_socket_waits_for_delayed_browser_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let browser = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            thread::sleep(Duration::from_millis(50));
+            stream
+                .write_all(
+                    b"GET /callback?code=test&state=test HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let mut accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        };
+        let request = read_callback_request(&mut accepted).unwrap();
+        assert!(request.starts_with("GET /callback?code=test"));
+        browser.join().unwrap();
     }
 }
