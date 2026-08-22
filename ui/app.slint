@@ -1,0 +1,208 @@
+import { Button, CheckBox, LineEdit, ListView, ScrollView, SpinBox } from "std-widgets.slint";
+
+export struct IssueRow {
+    key: string,
+    summary: string,
+    status: string,
+    assignee: string,
+    due: string,
+    estimate: string,
+    spent: string,
+    parent: string,
+}
+
+component SectionTitle inherits Text {
+    font-size: 13px;
+    font-weight: 700;
+    color: #24324a;
+    vertical-alignment: center;
+}
+
+component TreeButton inherits Rectangle {
+    in property <string> label;
+    in property <string> key;
+    in property <int> depth: 0;
+    callback chosen(string);
+    height: 34px;
+    border-radius: 5px;
+    background: touch.has-hover ? #e9efff : transparent;
+    Text { x: 9px + root.depth * 15px; width: parent.width - self.x - 6px; text: root.label; color: #334155; font-size: 12px; vertical-alignment: center; overflow: elide; }
+    touch := TouchArea { clicked => { root.chosen(root.key); } }
+}
+
+export component AppWindow inherits Window {
+    title: "Jira Lens";
+    width: 1280px;
+    height: 780px;
+    background: #f6f8fb;
+
+    in property <[IssueRow]> issues;
+    in-out property <string> selected-key: "APP-102";
+    in-out property <string> selected-summary: "課題一覧テーブル";
+    in-out property <string> selected-description: "Excelのように見通しのよい一覧を作る";
+    in-out property <string> selected-comments: "列の表示切替を追加";
+    in-out property <string> selected-due: "2026-08-28";
+    in-out property <string> selected-estimate: "12h";
+    in-out property <string> selected-spent: "4h";
+    in-out property <string> active-parent: "すべての課題";
+    in-out property <int> result-count: 0;
+    in-out property <bool> show-assignee: true;
+    in-out property <bool> show-due: true;
+    in-out property <bool> show-estimate: true;
+    in-out property <bool> show-spent: true;
+    in-out property <bool> show-calendar: false;
+    callback select-issue(string);
+    callback search(string);
+    callback filter-parent(string);
+
+    VerticalLayout {
+        spacing: 0px;
+        Rectangle {
+            height: 52px;
+            background: #172554;
+            HorizontalLayout {
+                padding-left: 18px; padding-right: 18px; spacing: 14px;
+                Text { text: "Jira Lens"; color: white; font-size: 19px; font-weight: 700; vertical-alignment: center; }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                Text { text: "DEMO・ローカル表示"; color: #c7d2fe; font-size: 12px; vertical-alignment: center; }
+                Button { text: "Jiraに接続"; }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 1px;
+            Rectangle {
+                width: 238px; background: #ffffff;
+                VerticalLayout {
+                    padding: 12px; spacing: 7px;
+                    SectionTitle { text: "課題ツリー"; height: 28px; }
+                    LineEdit { placeholder-text: "タイトル・本文・コメントを検索"; accepted => { root.search(self.text); } }
+                    TreeButton { label: "▾  すべての課題"; chosen(key) => { root.filter-parent(key); } }
+                    TreeButton { label: "▾  APP-100  デスクトップ版 v1"; key: "APP-100"; chosen(key) => { root.filter-parent(key); } }
+                    TreeButton { label: "APP-101  親子ツリー表示"; key: "APP-101"; depth: 1; chosen(key) => { root.filter-parent(key); } }
+                    TreeButton { label: "▾  APP-102  課題一覧テーブル"; key: "APP-102"; depth: 1; chosen(key) => { root.filter-parent(key); } }
+                    TreeButton { label: "APP-105  日付セルの編集"; key: "APP-105"; depth: 2; chosen(key) => { root.filter-parent(key); } }
+                    TreeButton { label: "APP-103  時間記録フォーム"; key: "APP-103"; depth: 1; chosen(key) => { root.filter-parent(key); } }
+                    TreeButton { label: "APP-104  バーンダウン"; key: "APP-104"; depth: 1; chosen(key) => { root.filter-parent(key); } }
+                    TreeButton { label: "▸  OPS-20  リリース準備"; key: "OPS-20"; chosen(key) => { root.filter-parent(key); } }
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+                    Text { text: "同期データは端末内にキャッシュ"; color: #94a3b8; font-size: 10px; }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1; background: #f8fafc;
+                VerticalLayout {
+                    padding: 14px; spacing: 10px;
+                    HorizontalLayout {
+                        height: 34px; spacing: 8px;
+                        SectionTitle { text: root.active-parent + "  ·  " + root.result-count + "件"; horizontal-stretch: 1; }
+                        table-search := LineEdit { width: 260px; placeholder-text: "一覧を検索"; accepted => { root.search(self.text); } }
+                        Button { text: "検索"; clicked => { root.search(table-search.text); } }
+                    }
+                    Rectangle {
+                        height: 40px; background: #eef2ff; border-radius: 6px;
+                        HorizontalLayout {
+                            padding-left: 10px; padding-right: 10px; spacing: 12px;
+                            Text { text: "表示列"; font-size: 11px; vertical-alignment: center; color: #475569; }
+                            CheckBox { text: "担当者"; checked <=> root.show-assignee; }
+                            CheckBox { text: "期限"; checked <=> root.show-due; }
+                            CheckBox { text: "見積"; checked <=> root.show-estimate; }
+                            CheckBox { text: "消費"; checked <=> root.show-spent; }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                        }
+                    }
+                    Rectangle {
+                        background: white; border-color: #e2e8f0; border-width: 1px; border-radius: 7px;
+                        VerticalLayout {
+                            spacing: 0px;
+                            Rectangle {
+                                height: 36px; background: #f1f5f9;
+                                HorizontalLayout { padding-left: 10px; padding-right: 10px; spacing: 8px;
+                                    Text { width: 76px; text: "キー"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
+                                    Text { horizontal-stretch: 1; text: "タイトル"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
+                                    Text { width: 70px; text: "状態"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
+                                    Text { visible: root.show-assignee; width: 72px; text: "担当者"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
+                                    Text { visible: root.show-due; width: 88px; text: "期限"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
+                                    Text { visible: root.show-estimate; width: 54px; text: "見積"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
+                                    Text { visible: root.show-spent; width: 54px; text: "消費"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
+                                }
+                            }
+                            list := ListView {
+                                for issue in root.issues : Rectangle {
+                                    height: 42px; width: list.viewport-width;
+                                    background: issue.key == root.selected-key ? #e0e7ff : touch.has-hover ? #f8fafc : white;
+                                    border-color: #eef2f7; border-width: 1px;
+                                    HorizontalLayout { padding-left: 10px; padding-right: 10px; spacing: 8px;
+                                        Text { width: 76px; text: issue.key; color: #1d4ed8; font-size: 11px; vertical-alignment: center; }
+                                        Text { horizontal-stretch: 1; text: issue.summary; color: #1e293b; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                                        Text { width: 70px; text: issue.status; color: issue.status == "完了" ? #15803d : #475569; font-size: 11px; vertical-alignment: center; }
+                                        Text { visible: root.show-assignee; width: 72px; text: issue.assignee; font-size: 11px; vertical-alignment: center; }
+                                        Text { visible: root.show-due; width: 88px; text: issue.due; font-size: 11px; vertical-alignment: center; }
+                                        Text { visible: root.show-estimate; width: 54px; text: issue.estimate; font-size: 11px; vertical-alignment: center; }
+                                        Text { visible: root.show-spent; width: 54px; text: issue.spent; font-size: 11px; vertical-alignment: center; }
+                                    }
+                                    touch := TouchArea { clicked => { root.select-issue(issue.key); } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 300px; background: white;
+                ScrollView {
+                    VerticalLayout {
+                        padding: 14px; spacing: 10px;
+                        Text { text: root.selected-key; color: #2563eb; font-size: 13px; font-weight: 700; }
+                        Text { text: root.selected-summary; color: #0f172a; font-size: 17px; font-weight: 700; wrap: word-wrap; }
+                        Text { text: root.selected-description; color: #475569; font-size: 12px; wrap: word-wrap; }
+                        Rectangle { height: 1px; background: #e2e8f0; }
+                        SectionTitle { text: "時間管理"; height: 24px; }
+                        Text { text: "初期見積もり"; font-size: 11px; color: #64748b; }
+                        LineEdit { text <=> root.selected-estimate; }
+                        Text { text: "作業開始日時"; font-size: 11px; color: #64748b; }
+                        HorizontalLayout { height: 32px; spacing: 6px;
+                            Button { horizontal-stretch: 1; text: root.selected-due; clicked => { root.show-calendar = !root.show-calendar; } }
+                            Button { width: 70px; text: "09:00"; }
+                        }
+                        Rectangle {
+                            visible: root.show-calendar;
+                            height: 190px; background: #f8fafc; border-color: #cbd5e1; border-width: 1px; border-radius: 6px;
+                            VerticalLayout { padding: 8px; spacing: 5px;
+                                HorizontalLayout { height: 28px; Button { text: "‹"; } Text { text: "2026年 8月"; horizontal-stretch: 1; horizontal-alignment: center; vertical-alignment: center; font-weight: 700; } Button { text: "›"; } }
+                                Text { text: " 日　月　火　水　木　金　土"; horizontal-alignment: center; color: #64748b; font-size: 11px; }
+                                Text { text: "　　　　　　　　1"; horizontal-alignment: center; font-size: 12px; }
+                                Text { text: " 2　 3　 4　 5　 6　 7　 8"; horizontal-alignment: center; font-size: 12px; }
+                                Text { text: " 9　10　11　12　13　14　15"; horizontal-alignment: center; font-size: 12px; }
+                                Text { text: "16　17　18　19　20　21　22"; horizontal-alignment: center; font-size: 12px; }
+                                Text { text: "23　24　25　26　27　28　29"; horizontal-alignment: center; font-size: 12px; color: #1d4ed8; font-weight: 700; }
+                                Text { text: "30　31"; horizontal-alignment: left; font-size: 12px; }
+                            }
+                        }
+                        Text { text: "作業時間（分）"; font-size: 11px; color: #64748b; }
+                        SpinBox { value: 60; minimum: 0; maximum: 1440; }
+                        Button { text: "作業時間を記録"; primary: true; }
+                        Text { text: "記録済み: " + root.selected-spent; font-size: 11px; color: #64748b; }
+                        Rectangle { height: 1px; background: #e2e8f0; }
+                        SectionTitle { text: "バーンダウン（APP-100）"; height: 24px; }
+                        Text { text: "残り 28h / 40h"; font-size: 12px; color: #475569; }
+                        Rectangle {
+                            height: 132px; background: #f8fafc; border-radius: 6px;
+                            HorizontalLayout { padding: 12px; spacing: 10px; alignment: end;
+                                for point in [{v: 102, l: "8/22"}, {v: 94, l: "8/24"}, {v: 84, l: "8/26"}, {v: 70, l: "8/28"}, {v: 58, l: "8/30"}, {v: 46, l: "9/1"}] : VerticalLayout {
+                                    alignment: end; spacing: 3px;
+                                    Rectangle { width: 24px; height: point.v * 1px; background: #6366f1; border-radius: 3px; }
+                                    Text { text: point.l; font-size: 8px; color: #64748b; horizontal-alignment: center; }
+                                }
+                            }
+                        }
+                        SectionTitle { text: "最新コメント"; height: 24px; }
+                        Text { text: root.selected-comments; wrap: word-wrap; font-size: 12px; color: #475569; }
+                    }
+                }
+            }
+        }
+    }
+}
