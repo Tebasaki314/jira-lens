@@ -77,6 +77,12 @@ impl Display for OAuthError {
 
 impl std::error::Error for OAuthError {}
 
+impl OAuthError {
+    pub fn message(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
 pub fn connect() -> Result<SavedSession, OAuthError> {
     let config = OAuthConfig::from_env()?;
     if let Some(previous_refresh_token) = load_refresh_token()

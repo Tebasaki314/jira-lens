@@ -11,6 +11,12 @@ export struct IssueRow {
     parent: string,
 }
 
+export struct TreeNode {
+    key: string,
+    label: string,
+    depth: int,
+}
+
 component SectionTitle inherits Text {
     font-size: 13px;
     font-weight: 700;
@@ -37,6 +43,7 @@ export component AppWindow inherits Window {
     background: #f6f8fb;
 
     in property <[IssueRow]> issues;
+    in property <[TreeNode]> tree-nodes;
     in-out property <string> selected-key: "APP-102";
     in-out property <string> selected-summary: "課題一覧テーブル";
     in-out property <string> selected-description: "Excelのように見通しのよい一覧を作る";
@@ -52,6 +59,7 @@ export component AppWindow inherits Window {
     in-out property <bool> show-spent: true;
     in-out property <bool> show-calendar: false;
     in-out property <bool> connection-busy: false;
+    in-out property <bool> has-synced-data: false;
     in-out property <string> connection-status: "未接続";
     callback select-issue(string);
     callback search(string);
@@ -68,7 +76,7 @@ export component AppWindow inherits Window {
                 Text { text: "Jira Lens"; color: white; font-size: 19px; font-weight: 700; vertical-alignment: center; }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
                 Text { text: root.connection-status; color: #c7d2fe; font-size: 12px; vertical-alignment: center; }
-                Button { enabled: !root.connection-busy; text: root.connection-busy ? "接続中…" : "Jiraに接続"; clicked => { root.connect-oauth(); } }
+                Button { enabled: !root.connection-busy; text: root.connection-busy ? "同期中…" : root.has-synced-data ? "再同期" : "Jiraに接続"; clicked => { root.connect-oauth(); } }
             }
         }
 
@@ -80,14 +88,15 @@ export component AppWindow inherits Window {
                     padding: 12px; spacing: 7px;
                     SectionTitle { text: "課題ツリー"; height: 28px; }
                     LineEdit { placeholder-text: "タイトル・本文・コメントを検索"; accepted => { root.search(self.text); } }
-                    TreeButton { label: "▾  すべての課題"; chosen(key) => { root.filter-parent(key); } }
-                    TreeButton { label: "▾  APP-100  デスクトップ版 v1"; key: "APP-100"; chosen(key) => { root.filter-parent(key); } }
-                    TreeButton { label: "APP-101  親子ツリー表示"; key: "APP-101"; depth: 1; chosen(key) => { root.filter-parent(key); } }
-                    TreeButton { label: "▾  APP-102  課題一覧テーブル"; key: "APP-102"; depth: 1; chosen(key) => { root.filter-parent(key); } }
-                    TreeButton { label: "APP-105  日付セルの編集"; key: "APP-105"; depth: 2; chosen(key) => { root.filter-parent(key); } }
-                    TreeButton { label: "APP-103  時間記録フォーム"; key: "APP-103"; depth: 1; chosen(key) => { root.filter-parent(key); } }
-                    TreeButton { label: "APP-104  バーンダウン"; key: "APP-104"; depth: 1; chosen(key) => { root.filter-parent(key); } }
-                    TreeButton { label: "▸  OPS-20  リリース準備"; key: "OPS-20"; chosen(key) => { root.filter-parent(key); } }
+                    tree := ListView {
+                        for node in root.tree-nodes : TreeButton {
+                            width: tree.viewport-width;
+                            label: node.label;
+                            key: node.key;
+                            depth: node.depth;
+                            chosen(key) => { root.filter-parent(key); }
+                        }
+                    }
                     Rectangle { vertical-stretch: 1; background: transparent; }
                     Text { text: "同期データは端末内にキャッシュ"; color: #94a3b8; font-size: 10px; }
                 }
