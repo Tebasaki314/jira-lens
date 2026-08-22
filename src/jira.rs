@@ -62,6 +62,7 @@ struct ApiFields {
     #[serde(default)]
     summary: String,
     status: Option<NamedValue>,
+    issuetype: Option<NamedValue>,
     assignee: Option<NamedValue>,
     duedate: Option<String>,
     timeoriginalestimate: Option<i64>,
@@ -232,6 +233,7 @@ pub fn fetch_all_issues(session: &SavedSession) -> Result<(JiraResource, Vec<Iss
     let fields = [
         "summary",
         "status",
+        "issuetype",
         "assignee",
         "duedate",
         "timeoriginalestimate",
@@ -370,6 +372,7 @@ impl From<ApiIssue> for Issue {
             key: issue.key,
             summary: fields.summary,
             status: named_value(fields.status),
+            issue_type: named_value(fields.issuetype),
             assignee: named_value(fields.assignee),
             due: fields.duedate.unwrap_or_default(),
             estimate: format_duration(fields.timeoriginalestimate),
@@ -464,6 +467,7 @@ mod tests {
                 "fields": {
                     "summary": "実課題",
                     "status": {"name": "進行中"},
+                    "issuetype": {"name": "タスク"},
                     "assignee": {"displayName": "Hiroshi"},
                     "parent": {"key": "REAL-0"},
                     "timeoriginalestimate": 5400,
@@ -480,6 +484,7 @@ mod tests {
         let item = Issue::from(page.issues.into_iter().next().unwrap());
         assert_eq!(item.key, "REAL-1");
         assert_eq!(item.parent, "REAL-0");
+        assert_eq!(item.issue_type, "タスク");
         assert_eq!(item.estimate, "1h 30m");
     }
 

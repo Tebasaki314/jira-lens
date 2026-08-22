@@ -1,9 +1,10 @@
-import { Button, CheckBox, LineEdit, ListView, ScrollView, SpinBox, TextEdit } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ListView, ScrollView, SpinBox, TextEdit } from "std-widgets.slint";
 
 export struct IssueRow {
     key: string,
     summary: string,
     status: string,
+    issue-type: string,
     assignee: string,
     due: string,
     estimate: string,
@@ -15,6 +16,8 @@ export struct TreeNode {
     key: string,
     label: string,
     depth: int,
+    has-children: bool,
+    expanded: bool,
 }
 
 export struct CalendarDay {
@@ -38,26 +41,64 @@ component SectionTitle inherits Text {
     vertical-alignment: center;
 }
 
+component PaneDivider inherits Rectangle {
+    in-out property <length> pane-size;
+    in property <length> minimum: 180px;
+    in property <length> maximum: 520px;
+    in property <float> direction: 1;
+    width: 7px;
+    background: drag.has-hover || drag.pressed ? #c7d2fe : #e2e8f0;
+    drag := TouchArea {
+        property <length> pressed-size;
+        mouse-cursor: ew-resize;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                self.pressed-size = root.pane-size;
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                root.pane-size = (self.pressed-size + (self.mouse-x - self.pressed-x) * root.direction).clamp(root.minimum, root.maximum);
+            }
+        }
+    }
+}
+
 component TreeButton inherits Rectangle {
     in property <string> label;
     in property <string> key;
     in property <int> depth: 0;
+    in property <bool> has-children;
+    in property <bool> expanded;
     callback chosen(string);
+    callback toggled(string);
     height: 34px;
     border-radius: 5px;
     background: touch.has-hover ? #e9efff : transparent;
-    Text { x: 9px + root.depth * 15px; width: parent.width - self.x - 6px; text: root.label; color: #334155; font-size: 12px; vertical-alignment: center; overflow: elide; }
-    touch := TouchArea { clicked => { root.chosen(root.key); } }
+    expand-box := Rectangle {
+        x: 5px + root.depth * 15px; y: 8px; width: 18px; height: 18px;
+        visible: root.has-children;
+        border-color: #cbd5e1; border-width: 1px; border-radius: 3px;
+        background: expand-touch.has-hover ? #e2e8f0 : white;
+        Text { text: root.expanded ? "-" : "+"; horizontal-alignment: center; vertical-alignment: center; font-size: 13px; color: #334155; }
+        expand-touch := TouchArea { clicked => { root.toggled(root.key); } }
+    }
+    Text { x: 28px + root.depth * 15px; width: parent.width - self.x - 6px; text: root.label; color: #334155; font-size: 12px; vertical-alignment: center; overflow: elide; }
+    touch := TouchArea { x: 25px + root.depth * 15px; width: parent.width - self.x; clicked => { root.chosen(root.key); } }
 }
 
 export component AppWindow inherits Window {
     title: "Jira Lens";
-    width: 1280px;
-    height: 780px;
+    preferred-width: 1280px;
+    preferred-height: 780px;
+    min-width: 900px;
+    min-height: 580px;
     background: #f6f8fb;
 
     in property <[IssueRow]> issues;
     in property <[TreeNode]> tree-nodes;
+    in property <[string]> issue-types;
+    in-out property <int> selected-type-index: 0;
     in property <[CalendarDay]> calendar-days;
     in property <[BurndownPoint]> burndown-points;
     in-out property <string> selected-key: "APP-102";
@@ -86,9 +127,13 @@ export component AppWindow inherits Window {
     in-out property <bool> connection-busy: false;
     in-out property <bool> has-synced-data: false;
     in-out property <string> connection-status: "未接続";
+    in-out property <length> left-pane-width: 260px;
+    in-out property <length> right-pane-width: 330px;
     callback select-issue(string);
     callback search(string);
     callback filter-parent(string);
+    callback filter-type(string);
+    callback toggle-tree(string);
     callback connect-oauth();
     callback save-issue(string, string, string, string, string);
     callback columns-changed(bool, bool, bool, bool);
@@ -96,6 +141,8 @@ export component AppWindow inherits Window {
     callback calendar-previous();
     callback calendar-next();
     callback choose-date(string);
+    callback open-selected-issue();
+    callback open-burndown();
 
     VerticalLayout {
         spacing: 0px;
@@ -107,31 +154,37 @@ export component AppWindow inherits Window {
                 Text { text: "Jira Lens"; color: white; font-size: 19px; font-weight: 700; vertical-alignment: center; }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
                 Text { text: root.connection-status; color: #c7d2fe; font-size: 12px; vertical-alignment: center; }
-                Button { enabled: !root.connection-busy; text: root.connection-busy ? "同期中…" : root.has-synced-data ? "再同期" : "Jiraに接続"; clicked => { root.connect-oauth(); } }
+                Button { enabled: !root.connection-busy; text: root.connection-busy ? "同期中..." : root.has-synced-data ? "再同期" : "Jiraに接続"; clicked => { root.connect-oauth(); } }
             }
         }
 
         HorizontalLayout {
-            spacing: 1px;
+            spacing: 0px;
             Rectangle {
-                width: 238px; background: #ffffff;
+                width: root.left-pane-width; background: #ffffff;
                 VerticalLayout {
                     padding: 12px; spacing: 7px;
                     SectionTitle { text: "課題ツリー"; height: 28px; }
                     LineEdit { placeholder-text: "タイトル・本文・コメントを検索"; accepted => { root.search(self.text); } }
+                    ComboBox { model: root.issue-types; current-index <=> root.selected-type-index; selected(value) => { root.filter-type(value); } }
                     tree := ListView {
+                        vertical-stretch: 1;
                         for node in root.tree-nodes : TreeButton {
                             width: tree.viewport-width;
                             label: node.label;
                             key: node.key;
                             depth: node.depth;
+                            has-children: node.has-children;
+                            expanded: node.expanded;
                             chosen(key) => { root.filter-parent(key); }
+                            toggled(key) => { root.toggle-tree(key); }
                         }
                     }
-                    Rectangle { vertical-stretch: 1; background: transparent; }
                     Text { text: "同期データは端末内にキャッシュ"; color: #94a3b8; font-size: 10px; }
                 }
             }
+
+            PaneDivider { pane-size <=> root.left-pane-width; minimum: 180px; maximum: 480px; }
 
             Rectangle {
                 horizontal-stretch: 1; background: #f8fafc;
@@ -139,7 +192,7 @@ export component AppWindow inherits Window {
                     padding: 14px; spacing: 10px;
                     HorizontalLayout {
                         height: 34px; spacing: 8px;
-                        SectionTitle { text: root.active-parent + "  ·  " + root.result-count + "件"; horizontal-stretch: 1; }
+                        SectionTitle { text: root.active-parent + " / " + root.result-count + "件"; horizontal-stretch: 1; }
                         table-search := LineEdit { width: 260px; placeholder-text: "一覧を検索"; accepted => { root.search(self.text); } }
                         Button { text: "検索"; clicked => { root.search(table-search.text); } }
                     }
@@ -193,12 +246,17 @@ export component AppWindow inherits Window {
                 }
             }
 
+            PaneDivider { pane-size <=> root.right-pane-width; minimum: 260px; maximum: 560px; direction: -1; }
+
             Rectangle {
-                width: 300px; background: white;
+                width: root.right-pane-width; background: white;
                 ScrollView {
                     VerticalLayout {
                         padding: 14px; spacing: 10px;
-                        Text { text: root.selected-key; color: #2563eb; font-size: 13px; font-weight: 700; }
+                        HorizontalLayout { height: 32px; spacing: 6px;
+                            Text { text: root.selected-key; color: #2563eb; font-size: 13px; font-weight: 700; vertical-alignment: center; horizontal-stretch: 1; }
+                            Button { text: "別ウィンドウ"; clicked => { root.open-selected-issue(); } }
+                        }
                         LineEdit { text <=> root.selected-summary; }
                         TextEdit { height: 92px; text <=> root.selected-description; wrap: word-wrap; }
                         Rectangle { height: 1px; background: #e2e8f0; }
@@ -214,7 +272,7 @@ export component AppWindow inherits Window {
                             visible: root.show-calendar;
                             height: 226px; background: #f8fafc; border-color: #cbd5e1; border-width: 1px; border-radius: 6px;
                             VerticalLayout { padding: 8px; spacing: 5px;
-                                HorizontalLayout { height: 28px; Button { text: "‹"; clicked => { root.calendar-previous(); } } Text { text: root.calendar-label; horizontal-stretch: 1; horizontal-alignment: center; vertical-alignment: center; font-weight: 700; } Button { text: "›"; clicked => { root.calendar-next(); } } }
+                                HorizontalLayout { height: 28px; Button { text: "<"; clicked => { root.calendar-previous(); } } Text { text: root.calendar-label; horizontal-stretch: 1; horizontal-alignment: center; vertical-alignment: center; font-weight: 700; } Button { text: ">"; clicked => { root.calendar-next(); } } }
                                 Text { text: " 日　月　火　水　木　金　土"; horizontal-alignment: center; color: #64748b; font-size: 11px; }
                                 GridLayout {
                                     height: 168px;
@@ -228,7 +286,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        Button { enabled: !root.action-busy && root.selected-key != ""; text: root.action-busy ? "更新中…" : "課題を保存"; primary: true; clicked => { root.save-issue(root.selected-key, root.selected-summary, root.selected-description, root.selected-due, root.selected-estimate); } }
+                        Button { enabled: !root.action-busy && root.selected-key != ""; text: root.action-busy ? "更新中..." : "課題を保存"; primary: true; clicked => { root.save-issue(root.selected-key, root.selected-summary, root.selected-description, root.selected-due, root.selected-estimate); } }
                         Rectangle { height: 1px; background: #e2e8f0; }
                         SectionTitle { text: "作業時間を記録"; height: 24px; }
                         Text { text: "作業開始日時"; font-size: 11px; color: #64748b; }
@@ -238,11 +296,14 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "作業時間（分）"; font-size: 11px; color: #64748b; }
                         SpinBox { value <=> root.worklog-minutes; minimum: 1; maximum: 1440; }
-                        Button { enabled: !root.action-busy && root.selected-key != ""; text: root.action-busy ? "登録中…" : "作業時間を記録"; primary: true; clicked => { root.log-work(root.selected-key, root.worklog-date, root.worklog-time, root.worklog-minutes); } }
+                        Button { enabled: !root.action-busy && root.selected-key != ""; text: root.action-busy ? "登録中..." : "作業時間を記録"; primary: true; clicked => { root.log-work(root.selected-key, root.worklog-date, root.worklog-time, root.worklog-minutes); } }
                         Text { visible: root.action-status != ""; text: root.action-status; wrap: word-wrap; font-size: 11px; color: #475569; }
                         Text { text: "記録済み: " + root.selected-spent; font-size: 11px; color: #64748b; }
                         Rectangle { height: 1px; background: #e2e8f0; }
-                        SectionTitle { text: root.burndown-title; height: 24px; }
+                        HorizontalLayout { height: 32px; spacing: 6px;
+                            SectionTitle { text: root.burndown-title; horizontal-stretch: 1; }
+                            Button { text: "別ウィンドウ"; clicked => { root.open-burndown(); } }
+                        }
                         Text { text: root.burndown-summary; font-size: 12px; color: #475569; }
                         Rectangle {
                             height: 132px; background: #f8fafc; border-radius: 6px;
@@ -258,6 +319,80 @@ export component AppWindow inherits Window {
                         SectionTitle { text: "最新コメント"; height: 24px; }
                         Text { text: root.selected-comments; wrap: word-wrap; font-size: 12px; color: #475569; }
                     }
+                }
+            }
+        }
+    }
+}
+
+export component IssueDetailWindow inherits Window {
+    in property <string> issue-key;
+    in property <string> summary;
+    in property <string> issue-type;
+    in property <string> status;
+    in property <string> assignee;
+    in property <string> due;
+    in property <string> estimate;
+    in property <string> spent;
+    in property <string> description;
+    in property <string> comments;
+
+    title: "Jira Lens - " + root.issue-key;
+    preferred-width: 700px;
+    preferred-height: 620px;
+    min-width: 420px;
+    min-height: 360px;
+    background: #f8fafc;
+
+    ScrollView {
+        VerticalLayout {
+            padding: 20px; spacing: 12px;
+            Text { text: root.issue-key; color: #2563eb; font-size: 14px; font-weight: 700; }
+            Text { text: root.summary; color: #0f172a; font-size: 21px; font-weight: 700; wrap: word-wrap; }
+            HorizontalLayout { height: 28px; spacing: 18px;
+                Text { text: "タイプ: " + root.issue-type; color: #475569; }
+                Text { text: "状態: " + root.status; color: #475569; }
+                Text { text: "担当: " + root.assignee; color: #475569; }
+            }
+            HorizontalLayout { height: 28px; spacing: 18px;
+                Text { text: "期限: " + (root.due == "" ? "未設定" : root.due); color: #475569; }
+                Text { text: "見積: " + root.estimate; color: #475569; }
+                Text { text: "消費: " + root.spent; color: #475569; }
+            }
+            Rectangle { height: 1px; background: #cbd5e1; }
+            SectionTitle { text: "本文"; height: 28px; }
+            Text { text: root.description; color: #334155; font-size: 13px; wrap: word-wrap; }
+            Rectangle { height: 1px; background: #cbd5e1; }
+            SectionTitle { text: "コメント"; height: 28px; }
+            Text { text: root.comments; color: #334155; font-size: 13px; wrap: word-wrap; }
+        }
+    }
+}
+
+export component BurndownChartWindow inherits Window {
+    in property <string> chart-title;
+    in property <string> summary;
+    in property <[BurndownPoint]> points;
+
+    title: "Jira Lens - " + root.chart-title;
+    preferred-width: 760px;
+    preferred-height: 480px;
+    min-width: 440px;
+    min-height: 300px;
+    background: #f8fafc;
+
+    VerticalLayout {
+        padding: 22px; spacing: 12px;
+        Text { text: root.chart-title; color: #0f172a; font-size: 21px; font-weight: 700; }
+        Text { text: root.summary; color: #475569; font-size: 13px; }
+        Rectangle {
+            vertical-stretch: 1; background: white; border-color: #e2e8f0; border-width: 1px; border-radius: 8px;
+            HorizontalLayout { padding: 22px; spacing: 18px; alignment: end;
+                for point in root.points : VerticalLayout {
+                    alignment: end; spacing: 5px;
+                    Text { text: point.remaining; font-size: 10px; color: #475569; horizontal-alignment: center; }
+                    Rectangle { width: 42px; height: point.height * 2px; background: #4f46e5; border-radius: 4px; }
+                    Text { text: point.label; font-size: 10px; color: #64748b; horizontal-alignment: center; }
                 }
             }
         }

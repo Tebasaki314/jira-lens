@@ -43,6 +43,10 @@ fn open() -> Result<Connection, String> {
         "ALTER TABLE issues ADD COLUMN spent_seconds INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    let _ = connection.execute(
+        "ALTER TABLE issues ADD COLUMN issue_type TEXT NOT NULL DEFAULT '未設定'",
+        [],
+    );
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS issue_snapshots (
@@ -116,8 +120,8 @@ pub fn replace_issues(resource: &JiraResource, issues: &[Issue]) -> Result<(), S
             .prepare(
                 "INSERT INTO issues (
                    site_id, issue_key, summary, status, assignee, due, estimate, spent,
-                   parent_key, description, comments, estimate_seconds, spent_seconds
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                   parent_key, description, comments, estimate_seconds, spent_seconds, issue_type
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )
             .map_err(|error| format!("SQLite保存処理を準備できません: {error}"))?;
         for issue in issues {
@@ -136,6 +140,7 @@ pub fn replace_issues(resource: &JiraResource, issues: &[Issue]) -> Result<(), S
                     issue.comments,
                     issue.estimate_seconds,
                     issue.spent_seconds,
+                    issue.issue_type,
                 ])
                 .map_err(|error| format!("課題キャッシュを保存できません: {error}"))?;
         }
@@ -205,7 +210,7 @@ pub fn load_latest() -> Result<Option<(JiraResource, Vec<Issue>)>, String> {
     let mut statement = connection
         .prepare(
             "SELECT issue_key, summary, status, assignee, due, estimate, spent,
-                    parent_key, description, comments, estimate_seconds, spent_seconds
+                    parent_key, description, comments, estimate_seconds, spent_seconds, issue_type
              FROM issues WHERE site_id = ?1 ORDER BY issue_key",
         )
         .map_err(|error| format!("課題キャッシュの読取を準備できません: {error}"))?;
@@ -224,6 +229,7 @@ pub fn load_latest() -> Result<Option<(JiraResource, Vec<Issue>)>, String> {
                 comments: row.get(9)?,
                 estimate_seconds: row.get(10)?,
                 spent_seconds: row.get(11)?,
+                issue_type: row.get(12)?,
             })
         })
         .map_err(|error| format!("課題キャッシュを読めません: {error}"))?
