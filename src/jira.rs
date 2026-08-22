@@ -3,6 +3,7 @@ use crate::oauth::{JiraResource, SavedSession};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::time::Duration;
 
 const PAGE_SIZE: u16 = 100;
@@ -27,6 +28,26 @@ struct SearchResponse {
     next_page_token: Option<String>,
     #[serde(default)]
     is_last: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectPage {
+    #[serde(default)]
+    values: Vec<ProjectRef>,
+    #[serde(default)]
+    start_at: usize,
+    #[serde(default)]
+    max_results: usize,
+    #[serde(default)]
+    total: usize,
+    #[serde(default)]
+    is_last: bool,
+}
+
+#[derive(Deserialize)]
+struct ProjectRef {
+    key: String,
 }
 
 #[derive(Deserialize)]
@@ -82,10 +103,7 @@ pub fn fetch_all_issues(session: &SavedSession) -> Result<(JiraResource, Vec<Iss
         .timeout(Duration::from_secs(45))
         .build()
         .map_err(|error| format!("Jira HTTPクライアントを作成できません: {error}"))?;
-    let endpoint = format!(
-        "https://api.atlassian.com/ex/jira/{}/rest/api/3/search/jql",
-        resource.id
-    );
+    let project_keys = fetch_project_keys(&client, &resource, &session.tokens.access_token)?;
     let fields = [
         "summary",
         "status",
@@ -97,20 +115,90 @@ pub fn fetch_all_issues(session: &SavedSession) -> Result<(JiraResource, Vec<Iss
         "description",
         "comment",
     ];
+    let mut result = Vec::new();
+    for project_key in project_keys {
+        result.extend(fetch_project_issues(
+            &client,
+            &resource,
+            &session.tokens.access_token,
+            &project_jql(&project_key),
+            &fields,
+        )?);
+    }
+
+    let mut seen = HashSet::new();
+    result.retain(|issue| seen.insert(issue.key.clone()));
+    Ok((resource, result))
+}
+
+fn fetch_project_keys(
+    client: &Client,
+    resource: &JiraResource,
+    access_token: &str,
+) -> Result<Vec<String>, String> {
+    let endpoint = format!(
+        "https://api.atlassian.com/ex/jira/{}/rest/api/3/project/search",
+        resource.id
+    );
+    let mut start_at = 0_usize;
+    let mut result = Vec::new();
+
+    for _ in 0..MAX_PAGES {
+        let response = client
+            .get(&endpoint)
+            .bearer_auth(access_token)
+            .header("Accept", "application/json")
+            .query(&[("startAt", start_at), ("maxResults", PAGE_SIZE as usize)])
+            .send()
+            .map_err(|error| format!("Jiraプロジェクトの取得に失敗しました: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            return Err(format!(
+                "Jiraプロジェクトの取得に失敗しました ({status}): {body}"
+            ));
+        }
+        let page = response
+            .json::<ProjectPage>()
+            .map_err(|error| format!("Jiraプロジェクト情報を解析できません: {error}"))?;
+        let item_count = page.values.len();
+        result.extend(page.values.into_iter().map(|project| project.key));
+        if page.is_last || item_count == 0 || page.start_at.saturating_add(item_count) >= page.total
+        {
+            return Ok(result);
+        }
+        start_at = page
+            .start_at
+            .saturating_add(page.max_results.max(item_count));
+    }
+    Err("Jiraプロジェクトのページ数が安全上限を超えました。".into())
+}
+
+fn fetch_project_issues(
+    client: &Client,
+    resource: &JiraResource,
+    access_token: &str,
+    jql: &str,
+    fields: &[&str],
+) -> Result<Vec<Issue>, String> {
+    let endpoint = format!(
+        "https://api.atlassian.com/ex/jira/{}/rest/api/3/search/jql",
+        resource.id
+    );
     let mut next_page_token = None;
     let mut result = Vec::new();
 
     for _ in 0..MAX_PAGES {
         let request = SearchRequest {
-            jql: "ORDER BY updated DESC",
-            fields: &fields,
+            jql,
+            fields,
             fields_by_keys: true,
             max_results: PAGE_SIZE,
             next_page_token: next_page_token.as_deref(),
         };
         let response = client
             .post(&endpoint)
-            .bearer_auth(&session.tokens.access_token)
+            .bearer_auth(access_token)
             .header("Accept", "application/json")
             .json(&request)
             .send()
@@ -125,11 +213,18 @@ pub fn fetch_all_issues(session: &SavedSession) -> Result<(JiraResource, Vec<Iss
             .map_err(|error| format!("Jiraレスポンスを解析できません: {error}"))?;
         result.extend(page.issues.into_iter().map(Issue::from));
         if page.is_last || page.next_page_token.is_none() {
-            return Ok((resource, result));
+            return Ok(result);
         }
         next_page_token = page.next_page_token;
     }
-    Err("Jira課題のページ数が安全上限を超えました。".into())
+    Err(format!(
+        "Jira課題のページ数が安全上限を超えました。対象JQL: {jql}"
+    ))
+}
+
+fn project_jql(project_key: &str) -> String {
+    let escaped = project_key.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("project = \"{escaped}\" ORDER BY updated DESC")
 }
 
 impl From<ApiIssue> for Issue {
@@ -254,5 +349,32 @@ mod tests {
         assert_eq!(item.key, "REAL-1");
         assert_eq!(item.parent, "REAL-0");
         assert_eq!(item.estimate, "1h 30m");
+    }
+
+    #[test]
+    fn builds_bounded_project_jql() {
+        assert_eq!(
+            project_jql("TEAM"),
+            "project = \"TEAM\" ORDER BY updated DESC"
+        );
+        assert_eq!(
+            project_jql("A\\\"B"),
+            "project = \"A\\\\\\\"B\" ORDER BY updated DESC"
+        );
+    }
+
+    #[test]
+    fn parses_project_search_page() {
+        let page: ProjectPage = serde_json::from_value(serde_json::json!({
+            "startAt": 0,
+            "maxResults": 50,
+            "total": 2,
+            "isLast": true,
+            "values": [{"key": "APP"}, {"key": "OPS"}]
+        }))
+        .unwrap();
+        assert_eq!(page.values.len(), 2);
+        assert_eq!(page.values[1].key, "OPS");
+        assert!(page.is_last);
     }
 }
