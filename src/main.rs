@@ -38,6 +38,18 @@ struct CustomField {
     editable: bool,
 }
 
+fn normalize_custom_field(mut field: CustomField) -> CustomField {
+    let is_flag = field.name.eq_ignore_ascii_case("flagged")
+        || matches!(field.name.as_str(), "フラグ" | "フラグ付き");
+    if is_flag {
+        field.field_type = "flag".into();
+        field.editable = true;
+    } else if matches!(field.field_type.as_str(), "boolean" | "flag") {
+        field.editable = true;
+    }
+    field
+}
+
 fn demo_issues() -> Vec<Issue> {
     vec![
         issue(
@@ -691,6 +703,10 @@ fn main() -> Result<(), slint::PlatformError> {
                 false,
             ),
         };
+    let initial_custom_fields = initial_custom_fields
+        .into_iter()
+        .map(normalize_custom_field)
+        .collect::<Vec<_>>();
     let issues = Arc::new(Mutex::new(initial_issues));
     let current_resource = Arc::new(Mutex::new(initial_resource));
     let custom_fields = Arc::new(Mutex::new(initial_custom_fields));
@@ -1610,6 +1626,18 @@ mod tests {
         let cells = row.custom_cells.iter().collect::<Vec<_>>();
         assert!(cells.iter().all(|cell| cell.boolean && cell.editable));
         assert!(cells.iter().all(|cell| cell.checked));
+    }
+
+    #[test]
+    fn cached_flagged_array_field_is_migrated_to_editable_flag() {
+        let field = normalize_custom_field(CustomField {
+            id: "customfield_10021".into(),
+            name: "Flagged".into(),
+            field_type: "array".into(),
+            editable: false,
+        });
+        assert_eq!(field.field_type, "flag");
+        assert!(field.editable);
     }
 
     #[test]

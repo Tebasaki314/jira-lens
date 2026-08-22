@@ -388,7 +388,7 @@ fn fetch_custom_fields(
 
 fn api_field_type(field: &ApiField) -> String {
     let is_flag = field.name.eq_ignore_ascii_case("flagged")
-        || field.name == "フラグ"
+        || matches!(field.name.as_str(), "フラグ" | "フラグ付き")
         || field
             .schema
             .as_ref()

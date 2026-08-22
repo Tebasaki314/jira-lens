@@ -182,6 +182,8 @@ export component AppWindow inherits Window {
     in-out property <string> connection-status: "未接続";
     in-out property <length> left-pane-width: 260px;
     in-out property <length> right-pane-width: 330px;
+    in-out property <bool> show-left-pane: true;
+    in-out property <bool> show-right-pane: true;
     in-out property <bool> edit-mode: false;
     in-out property <bool> confirm-discard: false;
     in-out property <length> issue-type-column-width: 96px;
@@ -236,6 +238,8 @@ export component AppWindow inherits Window {
             HorizontalLayout {
                 padding-left: 18px; padding-right: 18px; spacing: 14px;
                 Text { text: "Jira Lens"; color: white; font-size: 19px; font-weight: 700; vertical-alignment: center; }
+                Button { text: root.show-left-pane ? "ツリーを閉じる" : "ツリーを開く"; clicked => { root.show-left-pane = !root.show-left-pane; } }
+                Button { text: root.show-right-pane ? "詳細を閉じる" : "詳細を開く"; clicked => { root.show-right-pane = !root.show-right-pane; } }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
                 Text { text: root.connection-status; color: #c7d2fe; font-size: 12px; vertical-alignment: center; }
                 Button { enabled: !root.connection-busy; text: root.connection-busy ? "同期中..." : root.has-synced-data ? "再同期" : "Jiraに接続"; clicked => { root.connect-oauth(); } }
@@ -245,7 +249,7 @@ export component AppWindow inherits Window {
         HorizontalLayout {
             spacing: 0px;
             Rectangle {
-                width: root.left-pane-width; background: #ffffff;
+                visible: root.show-left-pane; width: root.show-left-pane ? root.left-pane-width : 0px; background: #ffffff;
                 VerticalLayout {
                     padding: 12px; spacing: 7px;
                     HorizontalLayout { height: 28px; spacing: 5px;
@@ -274,7 +278,7 @@ export component AppWindow inherits Window {
                 }
             }
 
-            PaneDivider { pane-size <=> root.left-pane-width; minimum: 180px; maximum: 480px; }
+            PaneDivider { visible: root.show-left-pane; width: root.show-left-pane ? 7px : 0px; pane-size <=> root.left-pane-width; minimum: 180px; maximum: 480px; }
 
             Rectangle {
                 horizontal-stretch: 1; min-width: 0px; preferred-width: 360px; background: #f8fafc;
@@ -395,10 +399,10 @@ export component AppWindow inherits Window {
                 }
             }
 
-            PaneDivider { pane-size <=> root.right-pane-width; minimum: 260px; maximum: 560px; direction: -1; }
+            PaneDivider { visible: root.show-right-pane; width: root.show-right-pane ? 7px : 0px; pane-size <=> root.right-pane-width; minimum: 260px; maximum: 560px; direction: -1; }
 
             Rectangle {
-                width: root.right-pane-width; background: white;
+                visible: root.show-right-pane; width: root.show-right-pane ? root.right-pane-width : 0px; background: white;
                 ScrollView {
                     VerticalLayout {
                         padding: 14px; spacing: 10px;
