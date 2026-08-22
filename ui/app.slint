@@ -4,19 +4,24 @@ export struct CustomCell {
     field-id: string,
     value: string,
     editable: bool,
+    boolean: bool,
 }
 
 export struct IssueRow {
     key: string,
     summary: string,
     status: string,
+    status-done: bool,
     issue-type: string,
     assignee: string,
     due: string,
     estimate: string,
     spent: string,
+    remaining: string,
     parent: string,
     depth: int,
+    has-children: bool,
+    expanded: bool,
     custom-cells: [CustomCell],
 }
 
@@ -41,12 +46,6 @@ export struct CalendarDay {
     row: int,
     column: int,
     current-month: bool,
-}
-
-export struct BurndownPoint {
-    label: string,
-    remaining: string,
-    height: int,
 }
 
 component SectionTitle inherits Text {
@@ -124,7 +123,9 @@ export component AppWindow inherits Window {
     in property <[string]> issue-types;
     in-out property <int> selected-type-index: 0;
     in property <[CalendarDay]> calendar-days;
-    in property <[BurndownPoint]> burndown-points;
+    in property <[string]> status-filters;
+    in-out property <int> selected-status-index: 0;
+    in-out property <string> active-status-filter: "すべての状態";
     in-out property <string> selected-key: "APP-102";
     in-out property <string> selected-summary: "課題一覧テーブル";
     in-out property <string> selected-description: "Excelのように見通しのよい一覧を作る";
@@ -132,22 +133,24 @@ export component AppWindow inherits Window {
     in-out property <string> selected-due: "2026-08-28";
     in-out property <string> selected-estimate: "12h";
     in-out property <string> selected-spent: "4h";
+    in-out property <string> selected-remaining: "8h";
     in-out property <string> active-parent: "すべての課題";
     in-out property <int> result-count: 0;
     in-out property <bool> show-assignee: true;
     in-out property <bool> show-due: true;
     in-out property <bool> show-estimate: true;
     in-out property <bool> show-spent: true;
+    in-out property <bool> show-remaining: true;
     in-out property <bool> show-calendar: false;
     in-out property <string> calendar-label: "";
     in-out property <string> calendar-target: "due";
     in-out property <string> worklog-date: "";
     in-out property <string> worklog-time: "09:00";
     in-out property <int> worklog-minutes: 60;
+    in-out property <string> worklog-remaining: "0h";
+    in-out property <bool> worklog-auto-adjust: true;
     in-out property <string> action-status: "";
     in-out property <bool> action-busy: false;
-    in-out property <string> burndown-title: "バーンダウン";
-    in-out property <string> burndown-summary: "履歴データなし";
     in-out property <bool> connection-busy: false;
     in-out property <bool> has-synced-data: false;
     in-out property <string> connection-status: "未接続";
@@ -160,22 +163,24 @@ export component AppWindow inherits Window {
     callback filter-parent(string);
     callback filter-type(string);
     callback toggle-tree(string);
+    callback expand-all-tree();
+    callback collapse-all-tree();
+    callback filter-status(string);
     callback toggle-favorite(string);
     callback connect-oauth();
     callback save-issue(string, string, string, string, string);
-    callback columns-changed(bool, bool, bool, bool);
+    callback columns-changed(bool, bool, bool, bool, bool);
     callback add-custom-column(string);
     callback remove-custom-column(string);
     callback begin-table-edit();
     callback edit-table-cell(string, string, string);
     callback save-table-edit();
     callback discard-table-edit();
-    callback log-work(string, string, string, int);
+    callback log-work(string, string, string, int, string, bool);
     callback calendar-previous();
     callback calendar-next();
     callback choose-date(string);
     callback open-selected-issue();
-    callback open-burndown();
 
     VerticalLayout {
         spacing: 0px;
@@ -197,7 +202,11 @@ export component AppWindow inherits Window {
                 width: root.left-pane-width; background: #ffffff;
                 VerticalLayout {
                     padding: 12px; spacing: 7px;
-                    SectionTitle { text: "課題ツリー"; height: 28px; }
+                    HorizontalLayout { height: 28px; spacing: 5px;
+                        SectionTitle { text: "課題ツリー"; horizontal-stretch: 1; }
+                        Button { text: "全部開く"; clicked => { root.expand-all-tree(); } }
+                        Button { text: "全部閉じる"; clicked => { root.collapse-all-tree(); } }
+                    }
                     LineEdit { placeholder-text: "タイトル・本文・コメントを検索"; accepted => { root.search(self.text); } }
                     ComboBox { model: root.issue-types; current-index <=> root.selected-type-index; selected(value) => { root.filter-type(value); } }
                     tree := ListView {
@@ -233,16 +242,18 @@ export component AppWindow inherits Window {
                         Button { visible: !root.edit-mode; text: "編集"; clicked => { root.begin-table-edit(); root.edit-mode = true; } }
                         Button { visible: root.edit-mode; text: "保存"; primary: true; clicked => { root.save-table-edit(); } }
                         Button { visible: root.edit-mode; text: "キャンセル"; clicked => { root.confirm-discard = true; } }
+                        ComboBox { enabled: !root.edit-mode; width: 130px; model: root.status-filters; current-index <=> root.selected-status-index; selected(value) => { root.active-status-filter = value; root.filter-status(value); } }
                     }
                     Rectangle {
                         height: 40px; background: #eef2ff; border-radius: 6px;
                         HorizontalLayout {
                             padding-left: 10px; padding-right: 10px; spacing: 12px;
                             Text { text: "表示列"; font-size: 11px; vertical-alignment: center; color: #475569; }
-                            CheckBox { text: "担当者"; checked <=> root.show-assignee; toggled => { root.columns-changed(root.show-assignee, root.show-due, root.show-estimate, root.show-spent); } }
-                            CheckBox { text: "期限"; checked <=> root.show-due; toggled => { root.columns-changed(root.show-assignee, root.show-due, root.show-estimate, root.show-spent); } }
-                            CheckBox { text: "見積"; checked <=> root.show-estimate; toggled => { root.columns-changed(root.show-assignee, root.show-due, root.show-estimate, root.show-spent); } }
-                            CheckBox { text: "消費"; checked <=> root.show-spent; toggled => { root.columns-changed(root.show-assignee, root.show-due, root.show-estimate, root.show-spent); } }
+                            CheckBox { text: "担当者"; checked <=> root.show-assignee; toggled => { root.columns-changed(root.show-assignee, root.show-due, root.show-estimate, root.show-spent, root.show-remaining); } }
+                            CheckBox { text: "期限"; checked <=> root.show-due; toggled => { root.columns-changed(root.show-assignee, root.show-due, root.show-estimate, root.show-spent, root.show-remaining); } }
+                            CheckBox { text: "見積"; checked <=> root.show-estimate; toggled => { root.columns-changed(root.show-assignee, root.show-due, root.show-estimate, root.show-spent, root.show-remaining); } }
+                            CheckBox { text: "消費"; checked <=> root.show-spent; toggled => { root.columns-changed(root.show-assignee, root.show-due, root.show-estimate, root.show-spent, root.show-remaining); } }
+                            CheckBox { text: "残余"; checked <=> root.show-remaining; toggled => { root.columns-changed(root.show-assignee, root.show-due, root.show-estimate, root.show-spent, root.show-remaining); } }
                             ComboBox { width: 150px; model: root.available-custom-fields; current-index <=> root.selected-custom-field-index; selected(value) => { root.add-custom-column(value); } }
                             for column in root.custom-columns : Button { text: column.name + " x"; clicked => { root.remove-custom-column(column.id); } }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
@@ -262,6 +273,7 @@ export component AppWindow inherits Window {
                                     Text { visible: root.show-due; width: 88px; text: "期限"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
                                     Text { visible: root.show-estimate; width: 54px; text: "見積"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
                                     Text { visible: root.show-spent; width: 54px; text: "消費"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
+                                    Text { visible: root.show-remaining; width: 54px; text: "残余"; font-weight: 700; font-size: 11px; vertical-alignment: center; }
                                     for column in root.custom-columns : Text { width: 110px; text: column.name; font-weight: 700; font-size: 11px; vertical-alignment: center; overflow: elide; }
                                 }
                             }
@@ -271,12 +283,18 @@ export component AppWindow inherits Window {
                                     background: issue.key == root.selected-key ? #e0e7ff : touch.has-hover ? #f8fafc : white;
                                     border-color: #eef2f7; border-width: 1px;
                                     HorizontalLayout { padding-left: 10px; padding-right: 10px; spacing: 8px;
-                                        Text { width: 76px; text: issue.key; color: #1d4ed8; font-size: 11px; vertical-alignment: center; }
-                                        Rectangle { horizontal-stretch: 1; background: transparent;
-                                            Text { visible: !root.edit-mode; x: issue.depth * 14px; width: parent.width - self.x; text: (issue.depth > 0 ? "- " : "") + issue.summary; color: #1e293b; font-size: 12px; vertical-alignment: center; overflow: elide; }
-                                            LineEdit { visible: root.edit-mode; x: issue.depth * 14px; width: parent.width - self.x; text: issue.summary; edited(value) => { root.edit-table-cell(issue.key, "summary", value); } }
+                                        Rectangle { width: 76px; background: transparent;
+                                            Rectangle { x: issue.depth * 12px; y: 12px; width: 17px; height: 17px; visible: issue.has-children; border-color: #cbd5e1; border-width: 1px; border-radius: 3px;
+                                                Text { text: issue.expanded ? "-" : "+"; horizontal-alignment: center; vertical-alignment: center; font-size: 11px; }
+                                                TouchArea { clicked => { root.toggle-tree(issue.key); } }
+                                            }
+                                            Text { x: issue.depth * 12px + (issue.has-children ? 21px : 0px); width: parent.width - self.x; text: issue.key; color: #1d4ed8; font-size: 10px; vertical-alignment: center; overflow: elide; }
                                         }
-                                        Text { width: 70px; text: issue.status; color: issue.status == "完了" ? #15803d : #475569; font-size: 11px; vertical-alignment: center; }
+                                        Rectangle { horizontal-stretch: 1; background: transparent;
+                                            Text { visible: !root.edit-mode; text: issue.summary; color: #1e293b; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                                            LineEdit { visible: root.edit-mode; width: parent.width; text: issue.summary; edited(value) => { root.edit-table-cell(issue.key, "summary", value); } }
+                                        }
+                                        Rectangle { width: 70px; background: issue.status-done ? #dcfce7 : #e0e7ff; border-radius: 8px; Text { text: issue.issue-type + " / " + issue.status; color: issue.status-done ? #15803d : #475569; font-size: 9px; vertical-alignment: center; horizontal-alignment: center; overflow: elide; } }
                                         Text { visible: root.show-assignee; width: 72px; text: issue.assignee; font-size: 11px; vertical-alignment: center; }
                                         Rectangle { visible: root.show-due; width: 88px; background: transparent;
                                             Text { visible: !root.edit-mode; text: issue.due; font-size: 11px; vertical-alignment: center; }
@@ -287,12 +305,17 @@ export component AppWindow inherits Window {
                                             LineEdit { visible: root.edit-mode; text: issue.estimate; edited(value) => { root.edit-table-cell(issue.key, "estimate", value); } }
                                         }
                                         Text { visible: root.show-spent; width: 54px; text: issue.spent; font-size: 11px; vertical-alignment: center; }
+                                        Rectangle { visible: root.show-remaining; width: 70px; background: transparent;
+                                            Text { visible: !root.edit-mode; text: issue.remaining; font-size: 11px; vertical-alignment: center; }
+                                            LineEdit { visible: root.edit-mode; text: issue.remaining; edited(value) => { root.edit-table-cell(issue.key, "remaining", value); } }
+                                        }
                                         for cell in issue.custom-cells : Rectangle { width: 110px; background: transparent;
                                             Text { visible: !root.edit-mode || !cell.editable; text: cell.value; font-size: 11px; vertical-alignment: center; overflow: elide; }
-                                            LineEdit { visible: root.edit-mode && cell.editable; text: cell.value; edited(value) => { root.edit-table-cell(issue.key, cell.field-id, value); } }
+                                            LineEdit { visible: root.edit-mode && cell.editable && !cell.boolean; text: cell.value; edited(value) => { root.edit-table-cell(issue.key, cell.field-id, value); } }
+                                            boolean-editor := CheckBox { visible: root.edit-mode && cell.editable && cell.boolean; checked: cell.value == "true"; toggled => { root.edit-table-cell(issue.key, cell.field-id, self.checked ? "true" : "false"); } }
                                         }
                                     }
-                                    touch := TouchArea { visible: !root.edit-mode; clicked => { root.select-issue(issue.key); } }
+                                    touch := TouchArea { visible: !root.edit-mode; x: 76px; width: parent.width - self.x; clicked => { root.select-issue(issue.key); } }
                                 }
                             }
                         }
@@ -350,26 +373,13 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "作業時間（分）"; font-size: 11px; color: #64748b; }
                         SpinBox { value <=> root.worklog-minutes; minimum: 1; maximum: 1440; }
-                        Button { enabled: !root.action-busy && root.selected-key != ""; text: root.action-busy ? "登録中..." : "作業時間を記録"; primary: true; clicked => { root.log-work(root.selected-key, root.worklog-date, root.worklog-time, root.worklog-minutes); } }
+                        CheckBox { text: "消費時間分だけ残余時間を自動で減らす"; checked <=> root.worklog-auto-adjust; }
+                        Text { text: "登録後の残余時間"; font-size: 11px; color: #64748b; }
+                        LineEdit { enabled: !root.worklog-auto-adjust; text <=> root.worklog-remaining; }
+                        Button { enabled: !root.action-busy && root.selected-key != ""; text: root.action-busy ? "登録中..." : "作業時間を記録"; primary: true; clicked => { root.log-work(root.selected-key, root.worklog-date, root.worklog-time, root.worklog-minutes, root.worklog-remaining, root.worklog-auto-adjust); } }
                         Text { visible: root.action-status != ""; text: root.action-status; wrap: word-wrap; font-size: 11px; color: #475569; }
-                        Text { text: "記録済み: " + root.selected-spent; font-size: 11px; color: #64748b; }
+                        Text { text: "記録済み: " + root.selected-spent + " / 残余: " + root.selected-remaining; font-size: 11px; color: #64748b; }
                         Rectangle { height: 1px; background: #e2e8f0; }
-                        HorizontalLayout { height: 32px; spacing: 6px;
-                            SectionTitle { text: root.burndown-title; horizontal-stretch: 1; }
-                            Button { text: "別ウィンドウ"; clicked => { root.open-burndown(); } }
-                        }
-                        Text { text: root.burndown-summary; font-size: 12px; color: #475569; }
-                        Rectangle {
-                            height: 132px; background: #f8fafc; border-radius: 6px;
-                            HorizontalLayout { padding: 12px; spacing: 10px; alignment: end;
-                                for point in root.burndown-points : VerticalLayout {
-                                    alignment: end; spacing: 3px;
-                                    Text { text: point.remaining; font-size: 8px; color: #475569; horizontal-alignment: center; }
-                                    Rectangle { width: 24px; height: point.height * 1px; background: #6366f1; border-radius: 3px; }
-                                    Text { text: point.label; font-size: 8px; color: #64748b; horizontal-alignment: center; }
-                                }
-                            }
-                        }
                         SectionTitle { text: "最新コメント"; height: 24px; }
                         Text { text: root.selected-comments; wrap: word-wrap; font-size: 12px; color: #475569; }
                     }
@@ -401,6 +411,7 @@ export component IssueDetailWindow inherits Window {
     in property <string> due;
     in property <string> estimate;
     in property <string> spent;
+    in property <string> remaining;
     in property <string> description;
     in property <string> comments;
 
@@ -425,6 +436,7 @@ export component IssueDetailWindow inherits Window {
                 Text { text: "期限: " + (root.due == "" ? "未設定" : root.due); color: #475569; }
                 Text { text: "見積: " + root.estimate; color: #475569; }
                 Text { text: "消費: " + root.spent; color: #475569; }
+                Text { text: "残余: " + root.remaining; color: #475569; }
             }
             Rectangle { height: 1px; background: #cbd5e1; }
             SectionTitle { text: "本文"; height: 28px; }
@@ -432,36 +444,6 @@ export component IssueDetailWindow inherits Window {
             Rectangle { height: 1px; background: #cbd5e1; }
             SectionTitle { text: "コメント"; height: 28px; }
             Text { text: root.comments; color: #334155; font-size: 13px; wrap: word-wrap; }
-        }
-    }
-}
-
-export component BurndownChartWindow inherits Window {
-    in property <string> chart-title;
-    in property <string> summary;
-    in property <[BurndownPoint]> points;
-
-    title: "Jira Lens - " + root.chart-title;
-    preferred-width: 760px;
-    preferred-height: 480px;
-    min-width: 440px;
-    min-height: 300px;
-    background: #f8fafc;
-
-    VerticalLayout {
-        padding: 22px; spacing: 12px;
-        Text { text: root.chart-title; color: #0f172a; font-size: 21px; font-weight: 700; }
-        Text { text: root.summary; color: #475569; font-size: 13px; }
-        Rectangle {
-            vertical-stretch: 1; background: white; border-color: #e2e8f0; border-width: 1px; border-radius: 8px;
-            HorizontalLayout { padding: 22px; spacing: 18px; alignment: end;
-                for point in root.points : VerticalLayout {
-                    alignment: end; spacing: 5px;
-                    Text { text: point.remaining; font-size: 10px; color: #475569; horizontal-alignment: center; }
-                    Rectangle { width: 42px; height: point.height * 2px; background: #4f46e5; border-radius: 4px; }
-                    Text { text: point.label; font-size: 10px; color: #64748b; horizontal-alignment: center; }
-                }
-            }
         }
     }
 }

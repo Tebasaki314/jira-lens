@@ -2,7 +2,7 @@ mod jira;
 mod oauth;
 mod storage;
 
-use chrono::{Datelike, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Local, NaiveDate};
 use slint::{Model, ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -16,13 +16,16 @@ struct Issue {
     key: String,
     summary: String,
     status: String,
+    status_done: bool,
     issue_type: String,
     assignee: String,
     due: String,
     estimate: String,
     spent: String,
+    remaining: String,
     estimate_seconds: i64,
     spent_seconds: i64,
+    remaining_seconds: i64,
     parent: String,
     description: String,
     comments: String,
@@ -143,6 +146,7 @@ fn issue(
         key: key.into(),
         summary: summary.into(),
         status: status.into(),
+        status_done: status == "完了",
         issue_type: if parent.is_empty() {
             "エピック"
         } else {
@@ -153,8 +157,10 @@ fn issue(
         due: due.into(),
         estimate: estimate.into(),
         spent: spent.into(),
+        remaining: estimate.into(),
         estimate_seconds: parse_duration(estimate).unwrap_or(0),
         spent_seconds: parse_duration(spent).unwrap_or(0),
+        remaining_seconds: parse_duration(estimate).unwrap_or(0),
         parent: parent.into(),
         description: description.into(),
         comments: comments.into(),
@@ -203,18 +209,27 @@ fn issue_depth(issue: &Issue, all: &[Issue]) -> i32 {
     depth
 }
 
-fn to_row(issue: &Issue, all: &[Issue], visible_custom_fields: &[CustomField]) -> IssueRow {
+fn to_row(
+    issue: &Issue,
+    all: &[Issue],
+    visible_custom_fields: &[CustomField],
+    collapsed: &HashSet<String>,
+) -> IssueRow {
     IssueRow {
         key: issue.key.clone().into(),
         summary: issue.summary.clone().into(),
         status: issue.status.clone().into(),
+        status_done: issue.status_done,
         issue_type: issue.issue_type.clone().into(),
         assignee: issue.assignee.clone().into(),
         due: issue.due.clone().into(),
         estimate: issue.estimate.clone().into(),
         spent: issue.spent.clone().into(),
+        remaining: issue.remaining.clone().into(),
         parent: issue.parent.clone().into(),
         depth: issue_depth(issue, all),
+        has_children: all.iter().any(|child| child.parent == issue.key),
+        expanded: !collapsed.contains(&issue.key),
         custom_cells: ModelRc::new(VecModel::from(
             visible_custom_fields
                 .iter()
@@ -227,6 +242,7 @@ fn to_row(issue: &Issue, all: &[Issue], visible_custom_fields: &[CustomField]) -
                         .unwrap_or_default()
                         .into(),
                     editable: field.editable,
+                    boolean: field.field_type == "boolean",
                 })
                 .collect::<Vec<_>>(),
         )),
@@ -239,6 +255,8 @@ fn filtered_rows(
     parent: &str,
     issue_type: &str,
     visible_custom_fields: &[CustomField],
+    status_filter: &str,
+    collapsed: &HashSet<String>,
 ) -> Vec<IssueRow> {
     let needle = query.to_lowercase();
     hierarchical_issues(all)
@@ -246,13 +264,36 @@ fn filtered_rows(
         .filter(|item| belongs_to_subtree(item, parent, all))
         .filter(|item| issue_type.is_empty() || item.issue_type == issue_type)
         .filter(|item| {
+            status_filter.is_empty()
+                || status_filter == "すべての状態"
+                || (status_filter == "完了以外" && !item.status_done)
+                || item.status == status_filter
+        })
+        .filter(|item| !hidden_by_collapsed(item, all, collapsed))
+        .filter(|item| {
             needle.is_empty()
                 || [&item.key, &item.summary, &item.description, &item.comments]
                     .iter()
                     .any(|value| value.to_lowercase().contains(&needle))
         })
-        .map(|issue| to_row(issue, all, visible_custom_fields))
+        .map(|issue| to_row(issue, all, visible_custom_fields, collapsed))
         .collect()
+}
+
+fn hidden_by_collapsed(issue: &Issue, all: &[Issue], collapsed: &HashSet<String>) -> bool {
+    let mut parent = issue.parent.as_str();
+    let mut visited = HashSet::new();
+    while !parent.is_empty() && visited.insert(parent) {
+        if collapsed.contains(parent) {
+            return true;
+        }
+        parent = all
+            .iter()
+            .find(|candidate| candidate.key == parent)
+            .map(|candidate| candidate.parent.as_str())
+            .unwrap_or("");
+    }
+    false
 }
 
 fn hierarchical_issues(all: &[Issue]) -> Vec<&Issue> {
@@ -345,6 +386,17 @@ fn build_tree_nodes(
             key = &current.parent;
         }
     }
+    if !issue_type.is_empty() {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for item in issues {
+                if included.contains(item.parent.as_str()) && included.insert(item.key.as_str()) {
+                    changed = true;
+                }
+            }
+        }
+    }
     let mut children: HashMap<&str, Vec<&Issue>> = HashMap::new();
     for item in issues
         .iter()
@@ -370,7 +422,6 @@ fn build_tree_nodes(
         visited: &mut HashSet<String>,
         result: &mut Vec<TreeNode>,
         favorites: &HashSet<String>,
-        ignore_collapsed: bool,
     ) {
         let Some(group) = children.get(parent) else {
             return;
@@ -384,10 +435,10 @@ fn build_tree_nodes(
                 label: format!("{}  {}", item.key, item.summary).into(),
                 depth,
                 has_children: children.contains_key(item.key.as_str()),
-                expanded: ignore_collapsed || !collapsed.contains(&item.key),
+                expanded: !collapsed.contains(&item.key),
                 favorite: favorites.contains(&item.key),
             });
-            if ignore_collapsed || !collapsed.contains(&item.key) {
+            if !collapsed.contains(&item.key) {
                 append(
                     &item.key,
                     depth + 1,
@@ -396,7 +447,6 @@ fn build_tree_nodes(
                     visited,
                     result,
                     favorites,
-                    ignore_collapsed,
                 );
             }
         }
@@ -415,27 +465,15 @@ fn build_tree_nodes(
         })
         .collect::<Vec<_>>();
     result.sort_by(|left, right| left.key.cmp(&right.key));
-    result.push(TreeNode {
-        key: "".into(),
-        label: "すべての課題".into(),
-        depth: 0,
-        has_children: children.contains_key(""),
-        expanded: !issue_type.is_empty() || !collapsed.contains(""),
-        favorite: false,
-    });
-    let ignore_collapsed = !issue_type.is_empty();
-    if ignore_collapsed || !collapsed.contains("") {
-        append(
-            "",
-            0,
-            &children,
-            collapsed,
-            &mut HashSet::new(),
-            &mut result,
-            favorites,
-            ignore_collapsed,
-        );
-    }
+    append(
+        "",
+        0,
+        &children,
+        collapsed,
+        &mut HashSet::new(),
+        &mut result,
+        favorites,
+    );
     result
 }
 
@@ -469,6 +507,8 @@ fn apply_issue_models(
         parent,
         issue_type,
         &visible_custom_fields,
+        ui.get_active_status_filter().as_str(),
+        collapsed,
     ));
     ui.set_result_count(rows.row_count() as i32);
     ui.set_issues(ModelRc::new(rows));
@@ -493,6 +533,25 @@ fn apply_issue_models(
             .collect::<Vec<_>>(),
     )));
     ui.set_selected_type_index(selected_type_index);
+    let mut statuses = issues
+        .iter()
+        .map(|issue| issue.status.clone())
+        .collect::<Vec<_>>();
+    statuses.sort();
+    statuses.dedup();
+    statuses.insert(0, "完了以外".into());
+    statuses.insert(0, "すべての状態".into());
+    let selected = statuses
+        .iter()
+        .position(|status| status == ui.get_active_status_filter().as_str())
+        .unwrap_or(0) as i32;
+    ui.set_status_filters(ModelRc::new(VecModel::from(
+        statuses
+            .into_iter()
+            .map(SharedString::from)
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_selected_status_index(selected);
 }
 
 fn apply_custom_field_models(
@@ -532,6 +591,8 @@ fn select_issue(ui: &AppWindow, item: &Issue) {
     ui.set_selected_due(item.due.clone().into());
     ui.set_selected_estimate(item.estimate.clone().into());
     ui.set_selected_spent(item.spent.clone().into());
+    ui.set_selected_remaining(item.remaining.clone().into());
+    ui.set_worklog_remaining(item.remaining.clone().into());
 }
 
 #[derive(Clone)]
@@ -573,84 +634,6 @@ fn apply_calendar(ui: &AppWindow, state: &CalendarState) {
         .collect::<Vec<_>>();
     ui.set_calendar_label(format!("{}年 {}月", state.year, state.month).into());
     ui.set_calendar_days(ModelRc::new(VecModel::from(days)));
-}
-
-fn display_duration(seconds: i64) -> String {
-    let hours = seconds / 3600;
-    let minutes = (seconds % 3600) / 60;
-    if minutes == 0 {
-        format!("{hours}h")
-    } else {
-        format!("{hours}h {minutes}m")
-    }
-}
-
-fn apply_burndown(ui: &AppWindow, resource: Option<&oauth::JiraResource>, root: &str) {
-    let title = if root.is_empty() {
-        "バーンダウン（すべて）".to_owned()
-    } else {
-        format!("バーンダウン（{root}）")
-    };
-    ui.set_burndown_title(title.into());
-    let Some(resource) = resource else {
-        ui.set_burndown_summary("同期後に履歴を表示します".into());
-        ui.set_burndown_points(ModelRc::new(VecModel::default()));
-        return;
-    };
-    match storage::load_burndown(&resource.id, root) {
-        Ok(samples) => {
-            let samples = samples
-                .into_iter()
-                .rev()
-                .take(10)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>();
-            let maximum = samples
-                .iter()
-                .map(|sample| sample.remaining_seconds)
-                .max()
-                .unwrap_or(0)
-                .max(1);
-            let points = samples
-                .iter()
-                .map(|sample| {
-                    let label = Local
-                        .timestamp_opt(sample.captured_at, 0)
-                        .single()
-                        .map(|time| time.format("%m/%d").to_string())
-                        .unwrap_or_else(|| "--/--".into());
-                    let height = if sample.remaining_seconds == 0 {
-                        2
-                    } else {
-                        (sample.remaining_seconds * 78 / maximum).max(6) as i32
-                    };
-                    BurndownPoint {
-                        label: label.into(),
-                        remaining: display_duration(sample.remaining_seconds).into(),
-                        height,
-                    }
-                })
-                .collect::<Vec<_>>();
-            let summary = samples
-                .last()
-                .map(|sample| {
-                    format!(
-                        "残り {}・{}回の同期履歴",
-                        display_duration(sample.remaining_seconds),
-                        samples.len()
-                    )
-                })
-                .unwrap_or_else(|| "履歴データなし".into());
-            ui.set_burndown_summary(summary.into());
-            ui.set_burndown_points(ModelRc::new(VecModel::from(points)));
-        }
-        Err(error) => {
-            ui.set_burndown_summary(format!("履歴エラー: {error}").into());
-            ui.set_burndown_points(ModelRc::new(VecModel::default()));
-        }
-    }
 }
 
 fn validate_due(value: &str) -> Result<(), String> {
@@ -709,15 +692,15 @@ fn main() -> Result<(), slint::PlatformError> {
     let collapsed_nodes = Arc::new(Mutex::new(HashSet::<String>::new()));
     let calendar_state = Arc::new(Mutex::new(CalendarState::today()));
     let detail_windows = Rc::new(RefCell::new(Vec::<IssueDetailWindow>::new()));
-    let chart_windows = Rc::new(RefCell::new(Vec::<BurndownChartWindow>::new()));
 
     ui.set_connection_status(initial_status.into());
     ui.set_has_synced_data(has_cache);
-    if let Ok((assignee, due, estimate, spent)) = storage::load_column_settings() {
+    if let Ok((assignee, due, estimate, spent, remaining)) = storage::load_column_settings() {
         ui.set_show_assignee(assignee);
         ui.set_show_due(due);
         ui.set_show_estimate(estimate);
         ui.set_show_spent(spent);
+        ui.set_show_remaining(remaining);
     }
     ui.set_worklog_date(
         Local::now()
@@ -746,7 +729,6 @@ fn main() -> Result<(), slint::PlatformError> {
         &favorite_nodes.lock().unwrap(),
     ))));
     apply_calendar(&ui, &calendar_state.lock().unwrap());
-    apply_burndown(&ui, current_resource.lock().unwrap().as_ref(), "");
 
     let weak = ui.as_weak();
     let issues_for_connect = issues.clone();
@@ -824,7 +806,6 @@ fn main() -> Result<(), slint::PlatformError> {
                             &collapsed_for_result.lock().unwrap(),
                             &favorites_for_result.lock().unwrap(),
                         ))));
-                        apply_burndown(&ui, Some(&resource), "");
                         ui.set_active_parent("すべての課題".into());
                         ui.set_has_synced_data(true);
                         ui.set_action_status("".into());
@@ -882,24 +863,9 @@ fn main() -> Result<(), slint::PlatformError> {
         window.set_due(item.due.clone().into());
         window.set_estimate(item.estimate.clone().into());
         window.set_spent(item.spent.clone().into());
+        window.set_remaining(item.remaining.clone().into());
         window.set_description(item.description.clone().into());
         window.set_comments(item.comments.clone().into());
-        if window.show().is_ok() {
-            windows.borrow_mut().push(window);
-        }
-    });
-
-    let weak = ui.as_weak();
-    let windows = chart_windows;
-    ui.on_open_burndown(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        let Ok(window) = BurndownChartWindow::new() else {
-            ui.set_action_status("バーンダウンウィンドウを作成できませんでした。".into());
-            return;
-        };
-        window.set_chart_title(ui.get_burndown_title());
-        window.set_summary(ui.get_burndown_summary());
-        window.set_points(ui.get_burndown_points());
         if window.show().is_ok() {
             windows.borrow_mut().push(window);
         }
@@ -927,7 +893,6 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let weak = ui.as_weak();
     let all = issues.clone();
-    let resource_for_filter = current_resource.clone();
     let query_state = current_query.clone();
     let parent_state = current_parent.clone();
     let type_state = current_type.clone();
@@ -942,11 +907,6 @@ fn main() -> Result<(), slint::PlatformError> {
                 &parent_state.lock().unwrap(),
                 &type_state.lock().unwrap(),
                 &collapsed_state.lock().unwrap(),
-            );
-            apply_burndown(
-                &ui,
-                resource_for_filter.lock().unwrap().as_ref(),
-                parent.as_str(),
             );
             ui.set_active_parent(if parent.is_empty() {
                 SharedString::from("すべての課題")
@@ -999,6 +959,73 @@ fn main() -> Result<(), slint::PlatformError> {
                 &parent_state.lock().unwrap(),
                 &type_state.lock().unwrap(),
                 &collapsed,
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
+    let all = issues.clone();
+    let query = current_query.clone();
+    let parent = current_parent.clone();
+    let issue_type = current_type.clone();
+    let collapsed = collapsed_nodes.clone();
+    ui.on_expand_all_tree(move || {
+        collapsed.lock().unwrap().clear();
+        if let Some(ui) = weak.upgrade() {
+            apply_issue_models(
+                &ui,
+                &all.lock().unwrap(),
+                &query.lock().unwrap(),
+                &parent.lock().unwrap(),
+                &issue_type.lock().unwrap(),
+                &collapsed.lock().unwrap(),
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
+    let all = issues.clone();
+    let query = current_query.clone();
+    let parent = current_parent.clone();
+    let issue_type = current_type.clone();
+    let collapsed = collapsed_nodes.clone();
+    ui.on_collapse_all_tree(move || {
+        let parent_keys = {
+            let guard = all.lock().unwrap();
+            guard
+                .iter()
+                .filter(|issue| guard.iter().any(|child| child.parent == issue.key))
+                .map(|issue| issue.key.clone())
+                .collect()
+        };
+        *collapsed.lock().unwrap() = parent_keys;
+        if let Some(ui) = weak.upgrade() {
+            apply_issue_models(
+                &ui,
+                &all.lock().unwrap(),
+                &query.lock().unwrap(),
+                &parent.lock().unwrap(),
+                &issue_type.lock().unwrap(),
+                &collapsed.lock().unwrap(),
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
+    let all = issues.clone();
+    let query = current_query.clone();
+    let parent = current_parent.clone();
+    let issue_type = current_type.clone();
+    let collapsed = collapsed_nodes.clone();
+    ui.on_filter_status(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            apply_issue_models(
+                &ui,
+                &all.lock().unwrap(),
+                &query.lock().unwrap(),
+                &parent.lock().unwrap(),
+                &issue_type.lock().unwrap(),
+                &collapsed.lock().unwrap(),
             );
         }
     });
@@ -1123,6 +1150,7 @@ fn main() -> Result<(), slint::PlatformError> {
             "summary" => issue.summary = value.to_string(),
             "duedate" => issue.due = value.to_string(),
             "estimate" => issue.estimate = value.to_string(),
+            "remaining" => issue.remaining = value.to_string(),
             id => {
                 issue.custom_values.insert(id.to_owned(), value.to_string());
             }
@@ -1183,6 +1211,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 if original.summary != updated.summary
                     || original.due != updated.due
                     || original.estimate != updated.estimate
+                    || original.remaining != updated.remaining
                     || original.custom_values != updated.custom_values
                 {
                     Some(updated.clone())
@@ -1202,6 +1231,10 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             if let Err(error) = parse_duration(&issue.estimate) {
                 ui.set_action_status(format!("{}: {error}", issue.key).into());
+                return;
+            }
+            if let Err(error) = parse_duration(&issue.remaining) {
+                ui.set_action_status(format!("{}: 残余時間: {error}", issue.key).into());
                 return;
             }
         }
@@ -1234,6 +1267,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         &issue.summary,
                         &issue.due,
                         parse_duration(&issue.estimate)?,
+                        parse_duration(&issue.remaining)?,
                         &issue.custom_values,
                         &field_defs,
                     )
@@ -1312,8 +1346,9 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let weak = ui.as_weak();
-    ui.on_columns_changed(move |assignee, due, estimate, spent| {
-        if let Err(error) = storage::save_column_settings((assignee, due, estimate, spent))
+    ui.on_columns_changed(move |assignee, due, estimate, spent, remaining| {
+        if let Err(error) =
+            storage::save_column_settings((assignee, due, estimate, spent, remaining))
             && let Some(ui) = weak.upgrade()
         {
             ui.set_action_status(error.into());
@@ -1411,7 +1446,6 @@ fn main() -> Result<(), slint::PlatformError> {
                         if let Some(item) = guard.iter().find(|item| item.key == key) {
                             select_issue(&ui, item);
                         }
-                        apply_burndown(&ui, Some(&resource), &parent);
                         ui.set_action_status(
                             cache_error
                                 .map(|error| format!("Jira更新済み・キャッシュ失敗: {error}"))
@@ -1435,7 +1469,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let parent_for_worklog = current_parent;
     let type_for_worklog = current_type;
     let collapsed_for_worklog = collapsed_nodes;
-    ui.on_log_work(move |key, date, time, minutes| {
+    ui.on_log_work(move |key, date, time, minutes, remaining, auto_adjust| {
         let Some(ui) = weak.upgrade() else { return };
         if ui.get_action_busy() {
             return;
@@ -1458,13 +1492,22 @@ fn main() -> Result<(), slint::PlatformError> {
         let key = key.to_string();
         let date = date.to_string();
         let time = time.to_string();
+        let remaining = remaining.to_string();
         std::thread::spawn(move || {
-            let result = jira::add_worklog(&session, &key, &date, &time, minutes)
-                .and_then(|()| jira::fetch_all_issues(&session))
-                .map(|(resource, fetched, fields)| {
-                    let cache_error = storage::replace_issues(&resource, &fetched, &fields).err();
-                    (resource, fetched, fields, cache_error)
-                });
+            let result = jira::add_worklog(
+                &session,
+                &key,
+                &date,
+                &time,
+                minutes,
+                &remaining,
+                auto_adjust,
+            )
+            .and_then(|()| jira::fetch_all_issues(&session))
+            .map(|(resource, fetched, fields)| {
+                let cache_error = storage::replace_issues(&resource, &fetched, &fields).err();
+                (resource, fetched, fields, cache_error)
+            });
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(ui) = weak_for_result.upgrade() else {
                     return;
@@ -1495,7 +1538,6 @@ fn main() -> Result<(), slint::PlatformError> {
                         if let Some(item) = guard.iter().find(|item| item.key == key) {
                             select_issue(&ui, item);
                         }
-                        apply_burndown(&ui, Some(&resource), &parent);
                         ui.set_action_status(
                             cache_error
                                 .map(|error| format!("Jira登録済み・キャッシュ失敗: {error}"))
@@ -1522,7 +1564,7 @@ mod tests {
     #[test]
     fn parent_filter_includes_all_descendants() {
         let items = demo_issues();
-        let keys: Vec<_> = filtered_rows(&items, "", "APP-102", "", &[])
+        let keys: Vec<_> = filtered_rows(&items, "", "APP-102", "", &[], "", &HashSet::new())
             .into_iter()
             .map(|row| row.key.to_string())
             .collect();
@@ -1532,8 +1574,14 @@ mod tests {
     #[test]
     fn search_covers_description_and_comments() {
         let items = demo_issues();
-        assert_eq!(filtered_rows(&items, "キーボード", "", "", &[]).len(), 1);
-        assert_eq!(filtered_rows(&items, "仮想リスト", "", "", &[]).len(), 1);
+        assert_eq!(
+            filtered_rows(&items, "キーボード", "", "", &[], "", &HashSet::new()).len(),
+            1
+        );
+        assert_eq!(
+            filtered_rows(&items, "仮想リスト", "", "", &[], "", &HashSet::new()).len(),
+            1
+        );
     }
 
     #[test]
@@ -1557,7 +1605,7 @@ mod tests {
     #[test]
     fn issue_type_filter_keeps_tree_ancestors_as_context() {
         let items = demo_issues();
-        let rows = filtered_rows(&items, "", "", "タスク", &[]);
+        let rows = filtered_rows(&items, "", "", "タスク", &[], "", &HashSet::new());
         assert_eq!(rows.len(), 5);
         let tree = build_tree_nodes(&items, "タスク", &HashSet::new(), &HashSet::new());
         assert!(tree.iter().any(|node| node.key.as_str() == "APP-100"));
@@ -1566,18 +1614,24 @@ mod tests {
     }
 
     #[test]
-    fn issue_type_filter_ignores_collapsed_ancestors() {
+    fn issue_type_filter_keeps_descendants_but_respects_collapse() {
         let tree = build_tree_nodes(
             &demo_issues(),
             "タスク",
             &HashSet::from(["APP-100".to_owned(), "APP-102".to_owned()]),
             &HashSet::new(),
         );
+        assert!(!tree.iter().any(|node| node.key.as_str() == "APP-105"));
+    }
+
+    #[test]
+    fn issue_type_tree_includes_all_descendant_types() {
+        let tree = build_tree_nodes(&demo_issues(), "エピック", &HashSet::new(), &HashSet::new());
         assert!(tree.iter().any(|node| node.key.as_str() == "APP-105"));
     }
 
     #[test]
-    fn favorites_are_pinned_before_the_tree_root() {
+    fn favorites_are_pinned_before_regular_roots() {
         let tree = build_tree_nodes(
             &demo_issues(),
             "",
@@ -1586,12 +1640,39 @@ mod tests {
         );
         assert_eq!(tree[0].key.as_str(), "APP-105");
         assert!(tree[0].favorite);
-        assert_eq!(tree[1].key.as_str(), "");
+        assert_eq!(tree[1].key.as_str(), "APP-100");
+    }
+
+    #[test]
+    fn tree_has_no_synthetic_all_issues_row() {
+        let tree = build_tree_nodes(&demo_issues(), "", &HashSet::new(), &HashSet::new());
+        assert!(tree.iter().all(|node| !node.key.is_empty()));
+    }
+
+    #[test]
+    fn table_collapse_hides_all_descendants() {
+        let rows = filtered_rows(
+            &demo_issues(),
+            "",
+            "",
+            "",
+            &[],
+            "",
+            &HashSet::from(["APP-100".to_owned()]),
+        );
+        assert!(rows.iter().any(|row| row.key.as_str() == "APP-100"));
+        assert!(!rows.iter().any(|row| row.key.as_str() == "APP-105"));
+    }
+
+    #[test]
+    fn incomplete_status_filter_excludes_done() {
+        let rows = filtered_rows(&demo_issues(), "", "", "", &[], "完了以外", &HashSet::new());
+        assert!(rows.iter().all(|row| row.status.as_str() != "完了"));
     }
 
     #[test]
     fn table_rows_include_hierarchy_depth() {
-        let rows = filtered_rows(&demo_issues(), "", "", "", &[]);
+        let rows = filtered_rows(&demo_issues(), "", "", "", &[], "", &HashSet::new());
         assert_eq!(
             rows.iter()
                 .find(|row| row.key.as_str() == "APP-105")

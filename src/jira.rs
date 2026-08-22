@@ -67,6 +67,7 @@ struct ApiFields {
     duedate: Option<String>,
     timeoriginalestimate: Option<i64>,
     timespent: Option<i64>,
+    timeestimate: Option<i64>,
     parent: Option<ParentIssue>,
     description: Option<Value>,
     comment: Option<CommentPage>,
@@ -94,6 +95,13 @@ struct NamedValue {
     #[serde(rename = "displayName")]
     display_name: Option<String>,
     name: Option<String>,
+    #[serde(rename = "statusCategory")]
+    status_category: Option<StatusCategory>,
+}
+
+#[derive(Deserialize)]
+struct StatusCategory {
+    key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -147,12 +155,14 @@ pub fn update_issue(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn update_issue_fields(
     session: &SavedSession,
     issue_key: &str,
     summary: &str,
     due: &str,
     estimate_seconds: i64,
+    remaining_seconds: i64,
     custom_values: &HashMap<String, String>,
     custom_fields: &[CustomField],
 ) -> Result<(), String> {
@@ -170,7 +180,10 @@ pub fn update_issue_fields(
     );
     fields.insert(
         "timetracking".into(),
-        serde_json::json!({"originalEstimate": jira_duration(estimate_seconds)}),
+        serde_json::json!({
+            "originalEstimate": jira_duration(estimate_seconds),
+            "remainingEstimate": jira_duration(remaining_seconds)
+        }),
     );
     for (id, value) in custom_values {
         let Some(field) = custom_fields
@@ -188,6 +201,17 @@ pub fn update_issue_fields(
                     .parse::<serde_json::Number>()
                     .map_err(|_| format!("{} は数値で入力してください。", field.name))?,
             )
+        } else if field.field_type == "boolean" {
+            Value::Bool(match value.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => true,
+                "false" | "0" | "no" | "off" => false,
+                _ => {
+                    return Err(format!(
+                        "{} は true または false で入力してください。",
+                        field.name
+                    ));
+                }
+            })
         } else {
             Value::String(value.to_string())
         };
@@ -229,6 +253,8 @@ pub fn add_worklog(
     date: &str,
     time: &str,
     minutes: i32,
+    remaining: &str,
+    auto_adjust: bool,
 ) -> Result<(), String> {
     if !(1..=1440).contains(&minutes) {
         return Err("作業時間は1〜1440分で指定してください。".into());
@@ -251,10 +277,22 @@ pub fn add_worklog(
         "started": started,
         "timeSpentSeconds": i64::from(minutes) * 60
     });
+    let query = if auto_adjust {
+        vec![("adjustEstimate", "auto".to_owned())]
+    } else {
+        vec![
+            ("adjustEstimate", "new".to_owned()),
+            (
+                "newEstimate",
+                jira_duration(crate::parse_duration(remaining)?),
+            ),
+        ]
+    };
     send_without_response(
         client
             .post(endpoint)
             .bearer_auth(&session.tokens.access_token)
+            .query(&query)
             .json(&body),
         "Jira作業時間の登録",
     )
@@ -317,6 +355,7 @@ pub fn fetch_all_issues(
         "duedate",
         "timeoriginalestimate",
         "timespent",
+        "timeestimate",
         "parent",
         "description",
         "comment",
@@ -376,7 +415,10 @@ fn fetch_custom_fields(
             CustomField {
                 id: field.id,
                 name: field.name,
-                editable: matches!(field_type.as_str(), "string" | "number" | "date"),
+                editable: matches!(
+                    field_type.as_str(),
+                    "string" | "number" | "date" | "boolean"
+                ),
                 field_type,
             }
         })
@@ -501,17 +543,37 @@ impl From<ApiIssue> for Issue {
             .filter(|(id, _)| id.starts_with("customfield_"))
             .map(|(id, value)| (id.clone(), display_custom_value(value)))
             .collect();
+        let (status, status_done) = fields
+            .status
+            .map(|value| {
+                let done = value
+                    .status_category
+                    .as_ref()
+                    .and_then(|category| category.key.as_deref())
+                    == Some("done");
+                (
+                    value
+                        .display_name
+                        .or(value.name)
+                        .unwrap_or_else(|| "未設定".into()),
+                    done,
+                )
+            })
+            .unwrap_or_else(|| ("未設定".into(), false));
         Self {
             key: issue.key,
             summary: fields.summary,
-            status: named_value(fields.status),
+            status,
+            status_done,
             issue_type: named_value(fields.issuetype),
             assignee: named_value(fields.assignee),
             due: fields.duedate.unwrap_or_default(),
             estimate: format_duration(fields.timeoriginalestimate),
             spent: format_duration(fields.timespent),
+            remaining: format_duration(fields.timeestimate),
             estimate_seconds: fields.timeoriginalestimate.unwrap_or(0),
             spent_seconds: fields.timespent.unwrap_or(0),
+            remaining_seconds: fields.timeestimate.unwrap_or(0),
             parent: fields.parent.map(|parent| parent.key).unwrap_or_default(),
             description: fields
                 .description
@@ -619,7 +681,7 @@ mod tests {
                 "key": "REAL-1",
                 "fields": {
                     "summary": "実課題",
-                    "status": {"name": "進行中"},
+                    "status": {"name": "完了済み", "statusCategory": {"key": "done"}},
                     "issuetype": {"name": "タスク"},
                     "assignee": {"displayName": "Hiroshi"},
                     "parent": {"key": "REAL-0"},
@@ -638,6 +700,7 @@ mod tests {
         assert_eq!(item.key, "REAL-1");
         assert_eq!(item.parent, "REAL-0");
         assert_eq!(item.issue_type, "タスク");
+        assert!(item.status_done);
         assert_eq!(item.estimate, "1h 30m");
     }
 
