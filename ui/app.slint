@@ -492,9 +492,18 @@ export component AppWindow inherits Window {
         Rectangle { width: 440px; height: min(460px, 150px + root.checkbox-options.length * 38px); x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; background: white; border-radius: 10px;
             VerticalLayout { padding: 20px; spacing: 12px;
                 Text { text: root.checkbox-editor-title; font-size: 16px; font-weight: 700; color: #0f172a; }
-                ScrollView { vertical-stretch: 1;
-                    VerticalLayout { spacing: 6px;
+                Text {
+                    visible: root.checkbox-options.length == 0;
+                    vertical-stretch: 1;
+                    text: "この課題では選択肢を利用できません。Jiraのフィールドコンテキストまたは編集画面で、この課題タイプが対象になっているか確認してください。";
+                    color: #64748b;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+                ScrollView { visible: root.checkbox-options.length > 0; vertical-stretch: 1;
+                    VerticalLayout { height: root.checkbox-options.length * 34px; spacing: 6px;
                         for option[index] in root.checkbox-options : CheckBox {
+                            height: 28px;
                             text: option.label;
                             checked: option.checked;
                             toggled => { root.toggle-checkbox-option(index, self.checked); }
@@ -503,7 +512,7 @@ export component AppWindow inherits Window {
                 }
                 HorizontalLayout { alignment: end; spacing: 8px;
                     Button { text: "キャンセル"; clicked => { root.checkbox-editor-open = false; } }
-                    Button { text: "反映"; primary: true; clicked => { root.apply-checkbox-options(); } }
+                    Button { enabled: root.checkbox-options.length > 0; text: "反映"; primary: true; clicked => { root.apply-checkbox-options(); } }
                 }
             }
         }

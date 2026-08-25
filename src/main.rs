@@ -801,8 +801,9 @@ fn main() -> Result<(), slint::PlatformError> {
         let parent_for_result = parent_for_connect.clone();
         let type_for_result = type_for_connect.clone();
         let collapsed_for_result = collapsed_for_connect.clone();
+        let existing_session = session_for_connect.lock().unwrap().clone();
         std::thread::spawn(move || {
-            let result = oauth::connect().and_then(|session| {
+            let fetch = |session: oauth::SavedSession| {
                 jira::fetch_all_issues(&session)
                     .map_err(oauth::OAuthError::message)
                     .map(|(resource, fetched, fields)| {
@@ -810,7 +811,18 @@ fn main() -> Result<(), slint::PlatformError> {
                             storage::replace_issues(&resource, &fetched, &fields).err();
                         (session, resource, fetched, fields, cache_error)
                     })
-            });
+            };
+            let result = if let Some(session) = existing_session {
+                match fetch(session) {
+                    Ok(result) => Ok(result),
+                    Err(error) if error.to_string().contains("401 Unauthorized") => {
+                        oauth::connect().and_then(fetch)
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                oauth::connect().and_then(fetch)
+            };
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(ui) = weak_for_result.upgrade() else {
                     return;
