@@ -92,6 +92,24 @@ struct ApiFieldSchema {
 }
 
 #[derive(Deserialize)]
+struct EditMeta {
+    #[serde(default)]
+    fields: HashMap<String, EditMetaField>,
+}
+
+#[derive(Deserialize)]
+struct EditMetaField {
+    #[serde(rename = "allowedValues", default)]
+    allowed_values: Vec<EditMetaOption>,
+}
+
+#[derive(Deserialize)]
+struct EditMetaOption {
+    id: Option<String>,
+    value: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct NamedValue {
     #[serde(rename = "displayName")]
     display_name: Option<String>,
@@ -191,6 +209,15 @@ pub fn update_issue_fields(
                     ));
                 }
             }
+        } else if field.field_type == "checkbox" {
+            checkbox_option_value(
+                &client,
+                resource,
+                &session.tokens.access_token,
+                issue_key,
+                field,
+                value,
+            )?
         } else {
             Value::String(value.to_string())
         };
@@ -207,6 +234,115 @@ pub fn update_issue_fields(
             .json(&body),
         "Jira課題の更新",
     )
+}
+
+fn checkbox_option_value(
+    client: &Client,
+    resource: &JiraResource,
+    access_token: &str,
+    issue_key: &str,
+    field: &CustomField,
+    value: &str,
+) -> Result<Value, String> {
+    let endpoint = format!("{}/editmeta", issue_endpoint(resource, issue_key));
+    let response = client
+        .get(endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()
+        .map_err(|error| format!("{} の選択肢を取得できません: {error}", field.name))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "{} の選択肢を取得できません ({status}): {}",
+            field.name,
+            response.text().unwrap_or_default()
+        ));
+    }
+    let edit_meta = response
+        .json::<EditMeta>()
+        .map_err(|error| format!("{} の選択肢を解析できません: {error}", field.name))?;
+    let options = edit_meta
+        .fields
+        .get(&field.id)
+        .map(|meta| meta.allowed_values.as_slice())
+        .unwrap_or_default();
+    checkbox_values(options, &field.name, value)
+}
+
+fn checkbox_values(
+    options: &[EditMetaOption],
+    field_name: &str,
+    value: &str,
+) -> Result<Value, String> {
+    let selected = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let mut result = Vec::new();
+    for selected_value in selected {
+        let Some(option) = options.iter().find(|option| {
+            option.value.as_deref() == Some(selected_value)
+                || option.id.as_deref() == Some(selected_value)
+        }) else {
+            return Err(format!(
+                "{} に選択肢「{}」はありません。",
+                field_name, selected_value
+            ));
+        };
+        if let Some(id) = &option.id {
+            result.push(serde_json::json!({"id": id}));
+        } else if let Some(value) = &option.value {
+            result.push(serde_json::json!({"value": value}));
+        }
+    }
+    Ok(Value::Array(result))
+}
+
+pub fn fetch_checkbox_options(
+    session: &SavedSession,
+    issue_key: &str,
+    field_id: &str,
+    field_name: &str,
+) -> Result<Vec<String>, String> {
+    let resource = primary_resource(session)?;
+    let client = jira_client()?;
+    let field = CustomField {
+        id: field_id.to_owned(),
+        name: field_name.to_owned(),
+        field_type: "checkbox".into(),
+        editable: true,
+    };
+    let endpoint = format!("{}/editmeta", issue_endpoint(resource, issue_key));
+    let response = client
+        .get(endpoint)
+        .bearer_auth(&session.tokens.access_token)
+        .header("Accept", "application/json")
+        .send()
+        .map_err(|error| format!("{} の選択肢を取得できません: {error}", field.name))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "{} の選択肢を取得できません ({status}): {}",
+            field.name,
+            response.text().unwrap_or_default()
+        ));
+    }
+    let meta = response
+        .json::<EditMeta>()
+        .map_err(|error| format!("{} の選択肢を解析できません: {error}", field.name))?;
+    Ok(meta
+        .fields
+        .get(field_id)
+        .map(|field| {
+            field
+                .allowed_values
+                .iter()
+                .filter_map(|option| option.value.clone().or_else(|| option.id.clone()))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 pub fn add_worklog(
@@ -376,7 +512,7 @@ fn fetch_custom_fields(
                 name: field.name,
                 editable: matches!(
                     field_type.as_str(),
-                    "string" | "number" | "date" | "boolean" | "flag"
+                    "string" | "number" | "date" | "boolean" | "flag" | "checkbox"
                 ),
                 field_type,
             }
@@ -396,6 +532,13 @@ fn api_field_type(field: &ApiField) -> String {
             .is_some_and(|custom| custom.contains("gh-flag"));
     if is_flag {
         "flag".to_owned()
+    } else if field
+        .schema
+        .as_ref()
+        .and_then(|schema| schema.custom.as_deref())
+        .is_some_and(|custom| custom.contains("multicheckboxes"))
+    {
+        "checkbox".to_owned()
     } else {
         field
             .schema
@@ -718,5 +861,35 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(api_field_type(&field), "flag");
+    }
+
+    #[test]
+    fn recognizes_regular_jira_checkbox_and_builds_multi_option_payload() {
+        let field: ApiField = serde_json::from_value(serde_json::json!({
+            "id": "customfield_10041",
+            "name": "Checkbox Test Field",
+            "custom": true,
+            "schema": {
+                "type": "array",
+                "items": "option",
+                "custom": "com.atlassian.jira.plugin.system.customfieldtypes:multicheckboxes"
+            }
+        }))
+        .unwrap();
+        assert_eq!(api_field_type(&field), "checkbox");
+        let options = vec![
+            EditMetaOption {
+                id: Some("10043".into()),
+                value: Some("One".into()),
+            },
+            EditMetaOption {
+                id: Some("10044".into()),
+                value: Some("Two".into()),
+            },
+        ];
+        assert_eq!(
+            checkbox_values(&options, "Checkbox Test Field", "One, Two").unwrap(),
+            serde_json::json!([{"id": "10043"}, {"id": "10044"}])
+        );
     }
 }

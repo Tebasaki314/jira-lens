@@ -41,10 +41,15 @@ struct CustomField {
 fn normalize_custom_field(mut field: CustomField) -> CustomField {
     let is_flag = field.name.eq_ignore_ascii_case("flagged")
         || matches!(field.name.as_str(), "フラグ" | "フラグ付き");
+    let name_lower = field.name.to_lowercase();
+    let is_checkbox = name_lower.contains("checkbox") || field.name.contains("チェックボックス");
     if is_flag {
         field.field_type = "flag".into();
         field.editable = true;
-    } else if matches!(field.field_type.as_str(), "boolean" | "flag") {
+    } else if is_checkbox && field.field_type == "array" {
+        field.field_type = "checkbox".into();
+        field.editable = true;
+    } else if matches!(field.field_type.as_str(), "boolean" | "flag" | "checkbox") {
         field.editable = true;
     }
     field
@@ -253,7 +258,8 @@ fn to_row(
                         .into(),
                     editable: field.editable,
                     boolean: matches!(field.field_type.as_str(), "boolean" | "flag"),
-                    checked: if field.field_type == "flag" {
+                    checkbox: field.field_type == "checkbox",
+                    checked: if matches!(field.field_type.as_str(), "flag" | "checkbox") {
                         issue
                             .custom_values
                             .get(&field.id)
@@ -1187,6 +1193,138 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let weak = ui.as_weak();
     let draft = edit_draft.clone();
+    let fields = custom_fields.clone();
+    let session = active_session.clone();
+    ui.on_open_checkbox_editor(move |key, field_id| {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.get_action_busy() {
+            return;
+        }
+        let Some(session_value) = session.lock().unwrap().clone() else {
+            ui.set_action_status("チェックボックスの編集前に再同期してください。".into());
+            return;
+        };
+        let field_id_value = field_id.to_string();
+        let field_name = fields
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|field| field.id == field_id_value)
+            .map(|field| field.name.clone())
+            .unwrap_or_else(|| field_id_value.clone());
+        let current = draft
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|items| items.get(key.as_str()))
+            .and_then(|issue| issue.custom_values.get(&field_id_value))
+            .cloned()
+            .unwrap_or_default();
+        let key_value = key.to_string();
+        ui.set_action_busy(true);
+        ui.set_action_status(format!("{} の選択肢を取得中...", field_name).into());
+        let weak_result = ui.as_weak();
+        std::thread::spawn(move || {
+            let result = jira::fetch_checkbox_options(
+                &session_value,
+                &key_value,
+                &field_id_value,
+                &field_name,
+            );
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak_result.upgrade() else {
+                    return;
+                };
+                ui.set_action_busy(false);
+                match result {
+                    Ok(options) => {
+                        let selected = current
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .collect::<HashSet<_>>();
+                        ui.set_checkbox_options(ModelRc::new(VecModel::from(
+                            options
+                                .into_iter()
+                                .map(|label| CheckboxOption {
+                                    checked: selected.contains(label.as_str()),
+                                    label: label.into(),
+                                })
+                                .collect::<Vec<_>>(),
+                        )));
+                        ui.set_checkbox_editor_key(key_value.into());
+                        ui.set_checkbox_editor_field_id(field_id_value.into());
+                        ui.set_checkbox_editor_title(field_name.into());
+                        ui.set_checkbox_editor_open(true);
+                        ui.set_action_status("".into());
+                    }
+                    Err(error) => ui.set_action_status(error.into()),
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
+    ui.on_toggle_checkbox_option(move |index, checked| {
+        let Some(ui) = weak.upgrade() else { return };
+        let model = ui.get_checkbox_options();
+        if let Some(mut option) = model.row_data(index as usize) {
+            option.checked = checked;
+            model.set_row_data(index as usize, option);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let draft = edit_draft.clone();
+    let all = issues.clone();
+    let query = current_query.clone();
+    let parent = current_parent.clone();
+    let issue_type = current_type.clone();
+    let collapsed = collapsed_nodes.clone();
+    ui.on_apply_checkbox_options(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let value = ui
+            .get_checkbox_options()
+            .iter()
+            .filter(|option| option.checked)
+            .map(|option| option.label.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let key = ui.get_checkbox_editor_key().to_string();
+        let field_id = ui.get_checkbox_editor_field_id().to_string();
+        let mut guard = draft.lock().unwrap();
+        if let Some(issue) = guard.as_mut().and_then(|items| items.get_mut(&key)) {
+            issue.custom_values.insert(field_id, value);
+        }
+        let originals = all.lock().unwrap();
+        let edited = guard.as_ref().map(|items| {
+            originals
+                .iter()
+                .map(|issue| {
+                    items
+                        .get(&issue.key)
+                        .cloned()
+                        .unwrap_or_else(|| issue.clone())
+                })
+                .collect::<Vec<_>>()
+        });
+        drop(originals);
+        drop(guard);
+        if let Some(edited) = edited {
+            apply_issue_models(
+                &ui,
+                &edited,
+                &query.lock().unwrap(),
+                &parent.lock().unwrap(),
+                &issue_type.lock().unwrap(),
+                &collapsed.lock().unwrap(),
+            );
+        }
+        ui.set_checkbox_editor_open(false);
+    });
+
+    let weak = ui.as_weak();
+    let draft = edit_draft.clone();
     let all = issues.clone();
     let query = current_query.clone();
     let parent = current_parent.clone();
@@ -1637,6 +1775,18 @@ mod tests {
             editable: false,
         });
         assert_eq!(field.field_type, "flag");
+        assert!(field.editable);
+    }
+
+    #[test]
+    fn cached_named_checkbox_array_is_migrated_to_editable_checkbox() {
+        let field = normalize_custom_field(CustomField {
+            id: "customfield_10041".into(),
+            name: "Checkbox Test Field".into(),
+            field_type: "array".into(),
+            editable: false,
+        });
+        assert_eq!(field.field_type, "checkbox");
         assert!(field.editable);
     }
 

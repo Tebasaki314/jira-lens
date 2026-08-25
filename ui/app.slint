@@ -5,6 +5,12 @@ export struct CustomCell {
     value: string,
     editable: bool,
     boolean: bool,
+    checkbox: bool,
+    checked: bool,
+}
+
+export struct CheckboxOption {
+    label: string,
     checked: bool,
 }
 
@@ -186,6 +192,11 @@ export component AppWindow inherits Window {
     in-out property <bool> show-right-pane: true;
     in-out property <bool> edit-mode: false;
     in-out property <bool> confirm-discard: false;
+    in-out property <bool> checkbox-editor-open: false;
+    in-out property <string> checkbox-editor-key: "";
+    in-out property <string> checkbox-editor-field-id: "";
+    in-out property <string> checkbox-editor-title: "";
+    in-out property <[CheckboxOption]> checkbox-options;
     in-out property <length> issue-type-column-width: 96px;
     in-out property <length> key-column-width: 112px;
     in-out property <length> summary-column-width: 300px;
@@ -223,6 +234,9 @@ export component AppWindow inherits Window {
     callback begin-table-edit();
     callback edit-table-cell(string, string, string);
     callback save-table-edit();
+    callback open-checkbox-editor(string, string);
+    callback toggle-checkbox-option(int, bool);
+    callback apply-checkbox-options();
     callback discard-table-edit();
     callback log-work(string, string, string, int, string, bool);
     callback calendar-previous();
@@ -387,8 +401,9 @@ export component AppWindow inherits Window {
                                         Rectangle { visible: root.show-remaining; width: 6px; background: transparent; }
                                         for cell in issue.custom-cells : HorizontalLayout { spacing: 0px; Rectangle { width: root.custom-column-width; background: transparent;
                                             Text { visible: !root.edit-mode || !cell.editable; text: cell.value; font-size: 11px; vertical-alignment: center; overflow: elide; }
-                                            LineEdit { visible: root.edit-mode && cell.editable && !cell.boolean; text: cell.value; edited(value) => { root.edit-table-cell(issue.key, cell.field-id, value); } }
+                                            LineEdit { visible: root.edit-mode && cell.editable && !cell.boolean && !cell.checkbox; text: cell.value; edited(value) => { root.edit-table-cell(issue.key, cell.field-id, value); } }
                                             boolean-editor := CheckBox { visible: root.edit-mode && cell.editable && cell.boolean; checked: cell.checked; toggled => { root.edit-table-cell(issue.key, cell.field-id, self.checked ? "true" : "false"); } }
+                                            Button { visible: root.edit-mode && cell.editable && cell.checkbox; text: cell.value == "" ? "選択..." : cell.value; clicked => { root.open-checkbox-editor(issue.key, cell.field-id); } }
                                         } Rectangle { width: 6px; background: transparent; } }
                                     }
                                     touch := TouchArea { visible: !root.edit-mode; x: root.issue-type-column-width + 6px; width: parent.width - self.x; clicked => { root.select-issue(issue.key); } }
@@ -468,6 +483,27 @@ export component AppWindow inherits Window {
                 HorizontalLayout { alignment: end; spacing: 8px;
                     Button { text: "戻る"; clicked => { root.confirm-discard = false; } }
                     Button { text: "変更を破棄"; clicked => { root.confirm-discard = false; root.discard-table-edit(); } }
+                }
+            }
+        }
+    }
+    if root.checkbox-editor-open : Rectangle {
+        background: #00000066;
+        Rectangle { width: 440px; height: min(460px, 150px + root.checkbox-options.length * 38px); x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; background: white; border-radius: 10px;
+            VerticalLayout { padding: 20px; spacing: 12px;
+                Text { text: root.checkbox-editor-title; font-size: 16px; font-weight: 700; color: #0f172a; }
+                ScrollView { vertical-stretch: 1;
+                    VerticalLayout { spacing: 6px;
+                        for option[index] in root.checkbox-options : CheckBox {
+                            text: option.label;
+                            checked: option.checked;
+                            toggled => { root.toggle-checkbox-option(index, self.checked); }
+                        }
+                    }
+                }
+                HorizontalLayout { alignment: end; spacing: 8px;
+                    Button { text: "キャンセル"; clicked => { root.checkbox-editor-open = false; } }
+                    Button { text: "反映"; primary: true; clicked => { root.apply-checkbox-options(); } }
                 }
             }
         }
